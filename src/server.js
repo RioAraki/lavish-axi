@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -206,18 +206,22 @@ export async function serve({
       // (`lavish-axi end`) keep reviving on the next open, same as before this change.
       if (existing?.status === "ended" && existing.ended_by === "user" && !reopen) {
         logEvent?.(`session open blocked (user-ended) key=${key} file=${file}`);
-        res.json({ key, file, url: existing.url, status: "user-ended" });
+        res.json({ key, file, slug: existing.slug, url: existing.url, status: "user-ended" });
         return;
       }
-      const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
-      const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
-      const session = await store.upsertSession(file, sessionUrl);
+      // The slug is minted (or recovered) by the store, so the URL is built from it rather than
+      // the other way around.
+      const session = await store.upsertSession(
+        file,
+        (slug) => `http://${hostForUrl(linkHostName)}:${publicPort}/session/${slug}`,
+      );
+      const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(session.url) : session.url;
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       }
-      logEvent?.(`session opened key=${key} file=${file}`);
+      logEvent?.(`session opened key=${key} slug=${session.slug} file=${file}`);
       await watchSession(session, watchers, events, logEvent);
-      res.json({ key, file, url, status: "opened" });
+      res.json({ key, file, slug: session.slug, url, status: "opened" });
     } catch (error) {
       next(error);
     }
@@ -448,9 +452,92 @@ export async function serve({
     }
   });
 
-  app.get("/session/:key", async (req, res, next) => {
+  // Machine-wide index of every session in state.json. Sessions are otherwise only reachable by
+  // a URL the agent printed once, so a closed tab used to mean a lost review surface.
+  app.get("/session", async (req, res, next) => {
+    try {
+      const sessions = await store.listSessions();
+      const entries = await Promise.all(
+        sessions.map(async (session) => {
+          const meta = await readArtifactMeta(session.file);
+          return {
+            key: session.key,
+            url: session.url,
+            file: session.file,
+            status: session.status,
+            pending_prompts: session.pending_prompts || 0,
+            title: meta.title,
+            description: meta.description,
+            opened_at: session.opened_at || "",
+            updated_at: session.updated_at || "",
+            missing: meta.missing,
+          };
+        }),
+      );
+      const sort = String(req.query.sort || "") === "recent" ? "recent" : "folder";
+      res.type("html").send(createIndexHtml(entries, { sort }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Deleting a session from the index also deletes the artifact file: the index is the only
+  // surface where a user asks to be rid of an artifact entirely, and leaving the HTML behind
+  // would have the next `lavish-axi <file>` resurrect a session they just removed.
+  async function purgeSession(session) {
+    await unlink(session.file).catch((error) => {
+      if (!error || error.code !== "ENOENT") throw error;
+    });
+    await store.deleteSession(session.key);
+    clearFeedbackDelivery(session.key, activePolls, deliveredFeedback, events);
+    events.emit("ended", session.key);
+    // The file is gone, so its watcher can only report the deletion to nobody.
+    const watcher = watchers.get(session.key);
+    if (watcher) {
+      watchers.delete(session.key);
+      watcher.close().catch(() => {});
+    }
+    logEvent?.(`session deleted key=${session.key} file=${session.file}`);
+  }
+
+  app.post("/api/:key/delete", async (req, res, next) => {
     try {
       const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      await purgeSession(session);
+      res.json({ status: "deleted", key: session.key, file: session.file });
+      await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Bulk path for the index's "Delete all" and 7-day prune. Unknown keys are skipped rather than
+  // failing the batch, so a stale page whose cards were already deleted elsewhere still works.
+  app.post("/api/batch-delete", async (req, res, next) => {
+    try {
+      const keys = Array.isArray(req.body?.keys) ? req.body.keys : [];
+      const deleted = [];
+      for (const rawKey of keys) {
+        const session = await store.findByKey(String(rawKey || ""));
+        if (!session) continue;
+        await purgeSession(session);
+        deleted.push(session.key);
+      }
+      res.json({ status: "deleted", deleted, count: deleted.length });
+      await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/session/:key", async (req, res, next) => {
+    try {
+      // New URLs carry the readable slug; sha256 keys printed by earlier versions still resolve.
+      const session = (await store.findByKey(req.params.key)) || (await store.findBySlug(req.params.key));
       if (!session) {
         res.status(404).send("Session not found");
         return;
@@ -1226,6 +1313,366 @@ export function extractArtifactHead(html) {
   const titleMatch = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   if (titleMatch) title = titleMatch[1].replace(/\s+/g, " ").trim();
   return { faviconTag, title };
+}
+
+// Artifact heads are small; scanning the leading slice keeps a huge artifact from being read
+// end-to-end just to label an index card.
+const MAX_META_BYTES = 64 * 1024;
+const STALE_SESSION_DAYS = 7;
+
+const BASIC_HTML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" };
+
+// One pass, so an escaped entity (`&amp;lt;`) decodes to `&lt;` rather than `<`.
+function decodeBasicEntities(value) {
+  return String(value).replace(/&(amp|lt|gt|quot|#39);/g, (match, name) => BASIC_HTML_ENTITIES[name] ?? match);
+}
+
+function collapseMetaText(value) {
+  return decodeBasicEntities(
+    String(value ?? "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
+// The index labels each session with the artifact's own <title> and description rather than a
+// file path, so a wall of cards is scannable. Reuses the same attribute tokenizer as
+// extractArtifactHead so `data-name=` or a quoted value never masquerades as `name=`.
+export function extractArtifactMeta(html) {
+  const head = String(html || "").slice(0, MAX_META_BYTES);
+  const titleMatch = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const metaTags = head.match(/<meta\b(?:"[^"]*"|'[^']*'|[^"'>])*>/gi) || [];
+  const descriptionTag = metaTags.find((tag) => readTagAttr(tag, "name").toLowerCase() === "description");
+  return {
+    title: titleMatch ? collapseMetaText(titleMatch[1]) : "",
+    description: descriptionTag ? collapseMetaText(readTagAttr(descriptionTag, "content")) : "",
+  };
+}
+
+// A session whose artifact was moved or deleted still has state worth showing (and deleting),
+// so an unreadable file is a rendered state, not an error.
+async function readArtifactMeta(file) {
+  try {
+    return { ...extractArtifactMeta(await readFile(file, "utf8")), missing: false };
+  } catch {
+    return { title: "", description: "", missing: true };
+  }
+}
+
+function entryFileName(entry) {
+  return entry?.file ? displayPathParts(String(entry.file), "").tail : "";
+}
+
+function entryTitle(entry) {
+  return String(entry?.title || entryFileName(entry) || entry?.key || "");
+}
+
+function entryTimestamp(entry) {
+  return Date.parse(String(entry?.updated_at || entry?.opened_at || ""));
+}
+
+// Newest first. Sessions whose timestamps are missing or corrupt sink below every dated one
+// instead of sorting as the epoch (which would make them look freshly touched).
+export function sortEntriesByRecency(entries) {
+  return [...(Array.isArray(entries) ? entries : [])].sort((a, b) => {
+    const aTime = entryTimestamp(a);
+    const bTime = entryTimestamp(b);
+    const aDated = Number.isFinite(aTime);
+    const bDated = Number.isFinite(bTime);
+    if (aDated !== bDated) return aDated ? -1 : 1;
+    if (aDated && bDated && aTime !== bTime) return bTime - aTime;
+    return entryTitle(a).localeCompare(entryTitle(b));
+  });
+}
+
+function statusLabel(status) {
+  const value = String(status || "open");
+  return value === "feedback" || value === "ended" ? value : "open";
+}
+
+function indexCard(entry, { home, recent }) {
+  const key = String(entry?.key || "");
+  const title = entryTitle(entry);
+  const { tail } = displayPathParts(String(entry?.file || ""), home);
+  const status = statusLabel(entry?.status);
+  const pending = Number(entry?.pending_prompts) || 0;
+  const missing = Boolean(entry?.missing);
+  const description = String(entry?.description || "");
+  // Only the recent view carries data-updated-at; its presence is what tells the client script
+  // to label the age line "updated". data-opened-at is always present because the 7-day prune
+  // measures age from first open in both views.
+  const updatedAttr = recent ? ` data-updated-at="${escapeHtml(String(entry?.updated_at || ""))}"` : "";
+  return `<article class="card${missing ? " is-missing" : ""}" data-key="${escapeHtml(key)}" data-opened-at="${escapeHtml(String(entry?.opened_at || ""))}"${updatedAttr}>
+<a class="card-open" href="${escapeHtml(String(entry?.url || ""))}">
+<div class="card-top"><h3 class="card-title">${escapeHtml(title)}</h3><span class="badge badge-${status}">${status}</span>${missing ? '<span class="badge badge-missing">missing</span>' : ""}${pending > 0 ? `<span class="badge badge-pending">${pending} pending</span>` : ""}</div>
+${description ? `<p class="card-desc">${escapeHtml(description)}</p>` : ""}
+<p class="card-file">${escapeHtml(tail)}</p>
+<p class="card-age"><span class="age-label">${recent ? "updated" : "opened"}</span> <span class="age-value">recently</span></p>
+</a>
+<button class="card-delete" type="button" data-delete-key="${escapeHtml(key)}" data-delete-title="${escapeHtml(title)}">Delete</button>
+</article>`;
+}
+
+function folderSections(entries, home) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const { head } = displayPathParts(String(entry?.file || ""), home);
+    if (!groups.has(head)) groups.set(head, []);
+    groups.get(head).push(entry);
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([dir, groupEntries]) => {
+      const sorted = [...groupEntries].sort((a, b) => entryTitle(a).localeCompare(entryTitle(b)));
+      const keys = sorted.map((entry) => String(entry?.key || "")).join(" ");
+      return `<section class="group" data-group data-keys="${escapeHtml(keys)}" data-dir="${escapeHtml(dir)}">
+<header class="group-head"><h2 class="group-dir">${escapeHtml(dir)}</h2><span class="group-count">${sorted.length}</span><button class="group-delete" type="button" data-delete-group>Delete all</button></header>
+<div class="cards">${sorted.map((entry) => indexCard(entry, { home, recent: false })).join("")}</div>
+</section>`;
+    })
+    .join("");
+}
+
+const INDEX_CSS = `
+:root { color-scheme: light dark; --bg: #f6f6f4; --panel: #ffffff; --ink: #1b1b19; --muted: #6b6b64; --line: #e2e2dc; --accent: #1f6feb; --danger: #b42318; }
+@media (prefers-color-scheme: dark) { :root { --bg: #131312; --panel: #1c1c1a; --ink: #ededea; --muted: #9a9a92; --line: #2e2e2a; --accent: #6da2ff; --danger: #ff6b5e; } }
+* { box-sizing: border-box; }
+body.lavish-index { margin: 0; padding: 32px clamp(16px, 5vw, 56px) 64px; background: var(--bg); color: var(--ink); font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.page-head { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; justify-content: space-between; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.page-head h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+.page-count { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+.page-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.toggle { display: inline-flex; padding: 3px; gap: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); }
+.toggle-option { padding: 5px 14px; border-radius: 999px; color: var(--muted); font-size: 13px; text-decoration: none; }
+.toggle-option.is-active { background: var(--ink); color: var(--bg); }
+.prune { padding: 7px 14px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--danger); font: inherit; font-size: 13px; cursor: pointer; }
+.prune[disabled] { color: var(--muted); cursor: default; opacity: 0.6; }
+.page-body { padding-top: 24px; }
+.group { margin-bottom: 32px; }
+.group-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 12px; }
+.group-dir { margin: 0; min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+.group-count { padding: 1px 8px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.group-delete { margin-left: auto; border: 0; background: none; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
+.group-delete:hover { color: var(--danger); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 12px; }
+.card { position: relative; display: flex; min-width: 0; flex-direction: column; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.card.is-missing { opacity: 0.72; }
+.card-open { display: block; min-width: 0; padding: 16px 16px 14px; color: inherit; text-decoration: none; }
+.card-top { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.card-title { margin: 0; min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; font-size: 15px; font-weight: 600; }
+.badge { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: 11px; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
+.badge-open { color: #2f7d32; border-color: currentColor; }
+.badge-feedback { color: var(--accent); border-color: currentColor; }
+.badge-missing { color: var(--danger); border-color: currentColor; }
+.badge-pending { color: var(--accent); border-color: currentColor; }
+.card-desc { margin: 8px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
+.card-file { margin: 10px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.card-age { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.card-delete { margin: 0 12px 12px auto; border: 0; background: none; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; }
+.card-delete:hover { color: var(--danger); }
+.empty { padding: 48px 0; text-align: center; }
+.empty-title { margin: 0; font-size: 17px; font-weight: 600; }
+.empty-copy { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.empty code { padding: 2px 6px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); font-size: 12px; }
+`;
+
+// Deletes are irreversible and remove the artifact file itself, so every path confirms first.
+const INDEX_SCRIPT = `
+(function () {
+  var STALE_MS = ${STALE_SESSION_DAYS} * 24 * 60 * 60 * 1000;
+  var pruneButton = document.getElementById("pruneStale");
+  var countLabel = document.getElementById("sessionCount");
+
+  function cards() {
+    return Array.prototype.slice.call(document.querySelectorAll(".card[data-key]"));
+  }
+
+  function relativeTime(iso) {
+    var at = Date.parse(iso || "");
+    if (!isFinite(at)) return "";
+    var minutes = Math.floor(Math.max(0, Date.now() - at) / 60000);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return minutes + "m ago";
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + "h ago";
+    return Math.floor(hours / 24) + "d ago";
+  }
+
+  function paintAges() {
+    cards().forEach(function (card) {
+      var updatedAt = card.getAttribute("data-updated-at");
+      var relative = relativeTime(updatedAt || card.getAttribute("data-opened-at"));
+      var label = card.querySelector(".age-label");
+      var value = card.querySelector(".age-value");
+      if (label) label.textContent = updatedAt ? "updated" : "opened";
+      if (value) value.textContent = relative || "at an unknown time";
+    });
+  }
+
+  function staleCards() {
+    var cutoff = Date.now() - STALE_MS;
+    return cards().filter(function (card) {
+      var openedAt = Date.parse(card.getAttribute("data-opened-at") || "");
+      return isFinite(openedAt) && openedAt < cutoff;
+    });
+  }
+
+  function refresh() {
+    paintAges();
+    var total = cards().length;
+    if (countLabel) countLabel.textContent = total + (total === 1 ? " session" : " sessions") + " on this machine";
+    if (!pruneButton) return;
+    var stale = staleCards().length;
+    pruneButton.textContent = stale > 0 ? "Delete not opened in 7d (" + stale + ")" : "Delete not opened in 7d";
+    pruneButton.disabled = stale === 0;
+  }
+
+  function postJson(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body || {}),
+    }).then(function (res) {
+      if (!res.ok) throw new Error("Request failed with status " + res.status);
+      return res.json();
+    });
+  }
+
+  function dropCards(list) {
+    list.forEach(function (card) {
+      var group = card.closest("[data-group]");
+      card.remove();
+      if (group && !group.querySelector(".card[data-key]")) group.remove();
+    });
+    refresh();
+  }
+
+  function failed(error) {
+    window.alert("Could not delete: " + (error && error.message ? error.message : String(error)));
+  }
+
+  function keysOf(list) {
+    return list.map(function (card) {
+      return card.getAttribute("data-key");
+    });
+  }
+
+  document.addEventListener("click", function (event) {
+    var target = event.target && event.target.closest ? event.target : null;
+    if (!target) return;
+
+    var deleteButton = target.closest("[data-delete-key]");
+    if (deleteButton) {
+      var card = deleteButton.closest(".card[data-key]");
+      var title = deleteButton.getAttribute("data-delete-title") || "this session";
+      if (!window.confirm("Delete " + title + "?\\n\\nThis permanently deletes the session AND its artifact HTML file from disk. It cannot be undone."))
+        return;
+      deleteButton.disabled = true;
+      postJson("/api/" + encodeURIComponent(deleteButton.getAttribute("data-delete-key")) + "/delete")
+        .then(function () {
+          if (card) dropCards([card]);
+        })
+        .catch(function (error) {
+          deleteButton.disabled = false;
+          failed(error);
+        });
+      return;
+    }
+
+    var groupButton = target.closest("[data-delete-group]");
+    if (groupButton) {
+      var group = groupButton.closest("[data-group]");
+      if (!group) return;
+      var groupCards = Array.prototype.slice.call(group.querySelectorAll(".card[data-key]"));
+      if (groupCards.length === 0) return;
+      if (
+        !window.confirm(
+          "Delete all " +
+            groupCards.length +
+            " session(s) in " +
+            (group.getAttribute("data-dir") || "this folder") +
+            "?\\n\\nThis permanently deletes each session AND its artifact HTML file from disk. It cannot be undone.",
+        )
+      )
+        return;
+      groupButton.disabled = true;
+      postJson("/api/batch-delete", { keys: keysOf(groupCards) })
+        .then(function () {
+          dropCards(groupCards);
+        })
+        .catch(function (error) {
+          groupButton.disabled = false;
+          failed(error);
+        });
+    }
+  });
+
+  if (pruneButton) {
+    pruneButton.addEventListener("click", function () {
+      var stale = staleCards();
+      if (stale.length === 0) return;
+      if (
+        !window.confirm(
+          "Delete " +
+            stale.length +
+            " session(s) not opened in the last 7 days?\\n\\nThis permanently deletes each session AND its artifact HTML file from disk. It cannot be undone.",
+        )
+      )
+        return;
+      pruneButton.disabled = true;
+      postJson("/api/batch-delete", { keys: keysOf(stale) })
+        .then(function () {
+          dropCards(stale);
+        })
+        .catch(function (error) {
+          failed(error);
+          refresh();
+        });
+    });
+  }
+
+  refresh();
+  setInterval(paintAges, 60000);
+})();
+`;
+
+export function createIndexHtml(entries, { home = homedir(), sort = "folder" } = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  const recent = sort === "recent";
+  const count = list.length;
+  const body =
+    count === 0
+      ? '<div class="empty"><p class="empty-title">No sessions yet.</p><p class="empty-copy">Run <code>lavish-axi &lt;html-file&gt;</code> to open an artifact for review.</p></div>'
+      : recent
+        ? `<section class="group" data-group data-keys="${escapeHtml(
+            sortEntriesByRecency(list)
+              .map((entry) => String(entry?.key || ""))
+              .join(" "),
+          )}"><div class="cards">${sortEntriesByRecency(list)
+            .map((entry) => indexCard(entry, { home, recent: true }))
+            .join("")}</div></section>`
+        : folderSections(list, home);
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lavish sessions</title>
+${LAVISH_DEFAULT_FAVICON}
+<style>${INDEX_CSS}</style>
+</head>
+<body class="lavish-index">
+<header class="page-head">
+<div class="page-titles"><h1>Lavish sessions</h1><p class="page-count" id="sessionCount">${count} session${count === 1 ? "" : "s"} on this machine</p></div>
+<div class="page-actions">
+<nav class="toggle" aria-label="Sort sessions"><a class="toggle-option${recent ? "" : " is-active"}" href="/session"${recent ? "" : ' aria-current="page"'}>By folder</a><a class="toggle-option${recent ? " is-active" : ""}" href="/session?sort=recent"${recent ? ' aria-current="page"' : ""}>Recent</a></nav>
+<button class="prune" id="pruneStale" type="button" disabled>Delete not opened in 7d</button>
+</div>
+</header>
+<main class="page-body" id="sessionList">${body}</main>
+<script>${INDEX_SCRIPT}</script>
+</body>
+</html>`;
 }
 
 export function createChromeHtml(

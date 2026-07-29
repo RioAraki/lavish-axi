@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -12,10 +13,12 @@ import {
   allowsAllHosts,
   buildAllowedHostnames,
   createChromeHtml,
+  createIndexHtml,
   createSdkJs,
   displayPathParts,
   exportContentDisposition,
   extractArtifactHead,
+  extractArtifactMeta,
   hasLiveReloadRootOptIn,
   hostnameFromHostHeader,
   isAllowedHostHeader,
@@ -25,6 +28,7 @@ import {
   resolveIdleTimeoutMs,
   resolveWatchTarget,
   serve,
+  sortEntriesByRecency,
 } from "../src/server.js";
 import { canonicalFile, sessionKey } from "../src/session-store.js";
 
@@ -3015,4 +3019,455 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
     '<head><link rel="icon" title="see href=data:image/png,decoy" href="https://cdn.example.com/logo.png"></head>',
   );
   assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
+});
+
+// ---------------------------------------------------------------------------
+// Session index: artifact metadata
+// ---------------------------------------------------------------------------
+
+test("extractArtifactMeta reads the artifact title and description", () => {
+  const html =
+    "<!doctype html><html><head><title>\n  Q3   Roadmap\n</title>" +
+    '<meta charset="utf-8"><meta name="description" content="  Plan   for   Q3  ">' +
+    "</head><body><title>later</title></body></html>";
+
+  assert.deepEqual(extractArtifactMeta(html), { title: "Q3 Roadmap", description: "Plan for Q3" });
+});
+
+test("extractArtifactMeta decodes the basic entities without double-decoding", () => {
+  const html =
+    "<html><head><title>Tools &amp; &quot;Toys&quot;</title>" +
+    "<meta name='description' content='&lt;script&gt; it&#39;s fine &amp;lt;'>" +
+    "</head></html>";
+
+  assert.deepEqual(extractArtifactMeta(html), {
+    title: 'Tools & "Toys"',
+    description: "<script> it's fine &lt;",
+  });
+});
+
+test("extractArtifactMeta returns empty strings when the head carries no metadata", () => {
+  assert.deepEqual(extractArtifactMeta("<html><head></head><body>hi</body></html>"), { title: "", description: "" });
+  assert.deepEqual(extractArtifactMeta(""), { title: "", description: "" });
+  assert.deepEqual(extractArtifactMeta(null), { title: "", description: "" });
+  // A `name`-suffixed attribute is not `name`.
+  assert.deepEqual(extractArtifactMeta('<head><meta data-name="description" content="nope"></head>'), {
+    title: "",
+    description: "",
+  });
+});
+
+test("extractArtifactMeta only scans the head of very large artifacts", () => {
+  const padded = `${"<!-- pad -->".repeat(8000)}<title>Way too late</title>`;
+
+  assert.ok(padded.length > 64 * 1024);
+  assert.equal(extractArtifactMeta(padded).title, "");
+});
+
+// ---------------------------------------------------------------------------
+// Session index: recency sorting
+// ---------------------------------------------------------------------------
+
+test("sortEntriesByRecency orders newest first and sinks undated entries", () => {
+  const entries = [
+    { key: "a", title: "Alpha", opened_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-02T00:00:00.000Z" },
+    { key: "b", title: "Bravo", opened_at: "2026-01-05T00:00:00.000Z" },
+    { key: "c", title: "Charlie", opened_at: "whenever", updated_at: "" },
+    { key: "d", title: "Delta", updated_at: "2026-01-02T00:00:00.000Z" },
+  ];
+  const snapshot = structuredClone(entries);
+
+  const sorted = sortEntriesByRecency(entries);
+
+  // Bravo is newest; Alpha and Delta tie on the same timestamp and break by title; Charlie sinks.
+  assert.deepEqual(
+    sorted.map((entry) => entry.key),
+    ["b", "a", "d", "c"],
+  );
+  assert.notEqual(sorted, entries);
+  assert.deepEqual(entries, snapshot);
+});
+
+test("sortEntriesByRecency tolerates junk input", () => {
+  assert.deepEqual(sortEntriesByRecency([]), []);
+  assert.deepEqual(sortEntriesByRecency(null), []);
+});
+
+// ---------------------------------------------------------------------------
+// Session index: HTML
+// ---------------------------------------------------------------------------
+
+function indexEntry(overrides = {}) {
+  return {
+    key: "0123456789abcdef",
+    url: "http://127.0.0.1:4387/session/plan",
+    file: "/home/dev/plans/plan.html",
+    status: "open",
+    pending_prompts: 0,
+    title: "Plan",
+    description: "",
+    opened_at: "2026-01-02T00:00:00.000Z",
+    updated_at: "2026-01-02T00:00:00.000Z",
+    missing: false,
+    ...overrides,
+  };
+}
+
+test("createIndexHtml groups cards by directory and sorts each group by title", () => {
+  const html = createIndexHtml(
+    [
+      indexEntry({ key: "k1", title: "Zebra", file: "/home/dev/plans/zebra.html" }),
+      indexEntry({ key: "k2", title: "Apple", file: "/home/dev/plans/apple.html" }),
+      indexEntry({ key: "k3", title: "Report", file: "/home/dev/audits/report.html" }),
+    ],
+    { home: "/home/dev" },
+  );
+
+  // Directory headers sort alphabetically: ~/audits/ before ~/plans/.
+  assert.ok(html.indexOf("~/audits/") < html.indexOf("~/plans/"));
+  // Cards inside a group sort by title: Apple before Zebra.
+  assert.ok(html.indexOf(">Apple<") < html.indexOf(">Zebra<"));
+  assert.match(html, /<h2 class="group-dir">~\/plans\/<\/h2>/);
+  assert.match(html, /data-keys="k2 k1"/);
+  assert.match(html, /3 sessions on this machine/);
+  // Folder view labels the age line "opened" and its cards carry no updated timestamp.
+  assert.match(html, /<span class="age-label">opened<\/span>/);
+  assert.equal(/data-updated-at="/.test(html), false);
+  // The "By folder" toggle is the active one.
+  assert.match(html, /<a class="toggle-option is-active" href="\/session" aria-current="page">By folder<\/a>/);
+  assert.match(html, /Delete not opened in 7d/);
+});
+
+test("createIndexHtml renders the recent view as one flat, recency-sorted list", () => {
+  const html = createIndexHtml(
+    [
+      indexEntry({ key: "k1", title: "Older", file: "/home/dev/a/older.html", updated_at: "2026-01-01T00:00:00.000Z" }),
+      indexEntry({ key: "k2", title: "Newer", file: "/home/dev/b/newer.html", updated_at: "2026-03-01T00:00:00.000Z" }),
+    ],
+    { home: "/home/dev", sort: "recent" },
+  );
+
+  assert.ok(html.indexOf(">Newer<") < html.indexOf(">Older<"));
+  // One flat section, no directory headers.
+  assert.equal(/class="group-dir"/.test(html), false);
+  assert.match(html, /data-updated-at="2026-03-01T00:00:00\.000Z"/);
+  assert.match(html, /<span class="age-label">updated<\/span>/);
+  assert.match(
+    html,
+    /<a class="toggle-option is-active" href="\/session\?sort=recent" aria-current="page">Recent<\/a>/,
+  );
+});
+
+test("createIndexHtml renders status, pending, and missing states", () => {
+  const html = createIndexHtml(
+    [
+      indexEntry({ key: "k1", title: "Waiting", status: "feedback", pending_prompts: 3 }),
+      indexEntry({ key: "k2", title: "Closed", status: "ended" }),
+      indexEntry({ key: "k3", title: "", file: "/home/dev/plans/gone.html", missing: true }),
+    ],
+    { home: "/home/dev" },
+  );
+
+  assert.match(html, /<span class="badge badge-feedback">feedback<\/span>/);
+  assert.match(html, /<span class="badge badge-pending">3 pending<\/span>/);
+  assert.match(html, /<span class="badge badge-ended">ended<\/span>/);
+  assert.match(html, /<span class="badge badge-missing">missing<\/span>/);
+  assert.match(html, /class="card is-missing"/);
+  // A title-less artifact falls back to its file name.
+  assert.match(html, /<h3 class="card-title">gone\.html<\/h3>/);
+  assert.match(html, /href="http:\/\/127\.0\.0\.1:4387\/session\/plan"/);
+});
+
+test("createIndexHtml escapes artifact-controlled text", () => {
+  const html = createIndexHtml(
+    [
+      indexEntry({
+        title: '<script>alert("x")</script>',
+        description: "5 > 3 && 2 < 4",
+        url: 'http://127.0.0.1:4387/session/x"onerror="alert(1)',
+      }),
+    ],
+    { home: "/home/dev" },
+  );
+
+  assert.equal(html.includes("<script>alert"), false);
+  assert.match(html, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;/);
+  assert.match(html, /5 &gt; 3 &amp;&amp; 2 &lt; 4/);
+  assert.match(html, /session\/x&quot;onerror=&quot;alert\(1\)/);
+});
+
+test("createIndexHtml renders an empty state with no sessions", () => {
+  const html = createIndexHtml([], { home: "/home/dev" });
+
+  assert.match(html, /No sessions yet\./);
+  assert.match(html, /0 sessions on this machine/);
+  assert.equal(/class="card /.test(html), false);
+});
+
+// ---------------------------------------------------------------------------
+// Session index + deletion routes
+// ---------------------------------------------------------------------------
+
+async function openSession(base, file) {
+  const res = await fetch(`${base}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file }),
+  });
+  assert.equal(res.status, 200);
+  return res.json();
+}
+
+test("GET /session lists every session on the machine, by folder and by recency", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const nested = path.join(dir, "nested");
+  await mkdir(nested);
+  const plan = path.join(dir, "plan.html");
+  const audit = path.join(nested, "audit.html");
+  await writeFile(
+    plan,
+    '<html><head><title>Launch Plan</title><meta name="description" content="Ship it"></head></html>',
+  );
+  await writeFile(audit, "<html><head><title>Audit</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    await openSession(base, plan);
+    await openSession(base, audit);
+
+    const folderRes = await fetch(`${base}/session`);
+    assert.equal(folderRes.status, 200);
+    assert.match(folderRes.headers.get("content-type") || "", /text\/html/);
+    const folderHtml = await folderRes.text();
+    assert.match(folderHtml, /2 sessions on this machine/);
+    assert.match(folderHtml, /Launch Plan/);
+    assert.match(folderHtml, /Ship it/);
+    assert.match(folderHtml, /Audit/);
+    assert.match(folderHtml, /class="group-dir"/);
+    assert.match(folderHtml, /href="http:\/\/127\.0\.0\.1:\d+\/session\/plan"/);
+
+    const recentHtml = await (await fetch(`${base}/session?sort=recent`)).text();
+    assert.match(recentHtml, /aria-current="page">Recent</);
+    assert.equal(/class="group-dir"/.test(recentHtml), false);
+    assert.match(recentHtml, /data-updated-at="/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /session marks sessions whose artifact file is gone", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const kept = path.join(dir, "kept.html");
+  const vanished = path.join(dir, "vanished.html");
+  await writeFile(kept, "<html><head><title>Kept</title></head></html>");
+  await writeFile(vanished, "<html><head><title>Vanished</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    await openSession(base, kept);
+    await openSession(base, vanished);
+    await rm(vanished);
+
+    const html = await (await fetch(`${base}/session`)).text();
+
+    assert.match(html, /badge badge-missing/);
+    // The unreadable artifact has no title left, so its card falls back to the file name.
+    assert.match(html, /vanished\.html/);
+    assert.match(html, /Kept/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/delete removes the session and its artifact file", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const doomed = path.join(dir, "doomed.html");
+  const kept = path.join(dir, "kept.html");
+  await writeFile(doomed, "<html><head><title>Doomed</title></head></html>");
+  await writeFile(kept, "<html><head><title>Kept</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const opened = await openSession(base, doomed);
+    await openSession(base, kept);
+
+    const res = await fetch(`${base}/api/${opened.key}/delete`, { method: "POST" });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.status, "deleted");
+    assert.equal(body.key, opened.key);
+    assert.equal(existsSync(doomed), false);
+    assert.equal(existsSync(kept), true);
+
+    const html = await (await fetch(`${base}/session`)).text();
+    assert.equal(/Doomed/.test(html), false);
+    assert.match(html, /1 session on this machine/);
+    assert.equal((await fetch(`${base}/session/${opened.key}`)).status, 404);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/:key/delete 404s an unknown key", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<html><head><title>Here</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    await openSession(base, artifact);
+
+    const res = await fetch(`${base}/api/deadbeefdeadbeef/delete`, { method: "POST" });
+
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: "session not found" });
+    assert.equal(existsSync(artifact), true);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/batch-delete purges known keys and skips unknown ones", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const first = path.join(dir, "first.html");
+  const second = path.join(dir, "second.html");
+  const kept = path.join(dir, "kept.html");
+  await writeFile(first, "<html><head><title>First</title></head></html>");
+  await writeFile(second, "<html><head><title>Second</title></head></html>");
+  await writeFile(kept, "<html><head><title>Kept</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const one = await openSession(base, first);
+    const two = await openSession(base, second);
+    await openSession(base, kept);
+
+    const res = await fetch(`${base}/api/batch-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys: [one.key, "deadbeefdeadbeef", two.key, ""] }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.status, "deleted");
+    assert.equal(body.count, 2);
+    assert.deepEqual(body.deleted, [one.key, two.key]);
+    assert.equal(existsSync(first), false);
+    assert.equal(existsSync(second), false);
+    assert.equal(existsSync(kept), true);
+
+    const html = await (await fetch(`${base}/session`)).text();
+    assert.match(html, /1 session on this machine/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/batch-delete tolerates a missing or malformed keys list", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<html><head><title>Here</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    await openSession(base, artifact);
+
+    const res = await fetch(`${base}/api/batch-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys: "not-an-array" }),
+    });
+
+    assert.deepEqual(await res.json(), { status: "deleted", deleted: [], count: 0 });
+    assert.equal(existsSync(artifact), true);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Readable slug URLs
+// ---------------------------------------------------------------------------
+
+test("POST /api/sessions returns a readable slug and a slug-based session URL", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-slug-"));
+  const artifact = path.join(dir, "Launch Plan.html");
+  await writeFile(artifact, "<html><head><title>Launch Plan</title></head><body>hi</body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const body = await openSession(base, artifact);
+
+    assert.equal(body.slug, "launch-plan");
+    assert.equal(body.url, `${base}/session/launch-plan`);
+    assert.equal(body.key, sessionKey(await canonicalFile(artifact)));
+
+    // The slug URL serves the chrome, which still addresses the artifact by sha256 key.
+    const chromeRes = await fetch(body.url);
+    assert.equal(chromeRes.status, 200);
+    const chrome = await chromeRes.text();
+    assert.match(chrome, new RegExp(`/artifact/${body.key}/index\\.html`));
+    assert.match(chrome, new RegExp(`"key":"${body.key}"`));
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /session/:key still resolves legacy sha256 session URLs", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-slug-"));
+  const artifact = path.join(dir, "plan.html");
+  await writeFile(artifact, "<html><head><title>Plan</title></head><body>hi</body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const body = await openSession(base, artifact);
+
+    const legacy = await fetch(`${base}/session/${body.key}`);
+    const slugged = await fetch(`${base}/session/${body.slug}`);
+
+    assert.equal(legacy.status, 200);
+    assert.equal(slugged.status, 200);
+    assert.equal((await fetch(`${base}/session/no-such-session`)).status, 404);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sessions with the same file name get distinct slugs that both resolve", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-slug-"));
+  const nested = path.join(dir, "nested");
+  await mkdir(nested);
+  const first = path.join(dir, "plan.html");
+  const second = path.join(nested, "plan.html");
+  await writeFile(first, "<html><head><title>First</title></head></html>");
+  await writeFile(second, "<html><head><title>Second</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const one = await openSession(base, first);
+    const two = await openSession(base, second);
+
+    assert.equal(one.slug, "plan");
+    assert.equal(two.slug, "plan-2");
+    assert.equal((await fetch(`${base}/session/plan`)).status, 200);
+    assert.equal((await fetch(`${base}/session/plan-2`)).status, 200);
+
+    // Re-opening keeps the slug stable, so a shared link never points at another artifact.
+    const reopened = await openSession(base, first);
+    assert.equal(reopened.slug, "plan");
+    assert.equal(reopened.url, `${base}/session/plan`);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

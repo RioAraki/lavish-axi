@@ -26,6 +26,26 @@ export class SessionStore {
     return state.sessions[key] || null;
   }
 
+  // Slugs are a readable alias for the sha256 key in session URLs only; every other route
+  // (chrome, /artifact, /events, poll) still addresses sessions by key.
+  async findBySlug(slug) {
+    const wanted = String(slug || "");
+    if (!wanted) return null;
+    const state = await this.readState();
+    return Object.values(state.sessions).find((session) => session.slug === wanted) || null;
+  }
+
+  async deleteSession(key) {
+    const state = await this.readState();
+    const session = state.sessions[key];
+    if (!session) return null;
+    delete state.sessions[key];
+    await this.writeState(state);
+    return session;
+  }
+
+  // `url` may be a builder `(slug, key) => string` for callers that need the slug the store
+  // just minted; a plain string is stored verbatim.
   async upsertSession(file, url) {
     const absolute = await canonicalFile(file);
     const key = sessionKey(absolute);
@@ -33,10 +53,14 @@ export class SessionStore {
     const existing = state.sessions[key] || {};
     const existingPrompts = existing.prompts || [];
     const existingStatus = existing.status === "ended" ? "open" : existing.status || "open";
+    // Stable per file: a re-open keeps the slug it was first given, so previously shared
+    // session links keep resolving even after sibling sessions come and go.
+    const slug = existing.slug || uniqueSlug(slugForFile(absolute), key, state.sessions);
     const session = {
       key,
       file: absolute,
-      url,
+      slug,
+      url: typeof url === "function" ? url(slug, key) : url,
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
       pending_prompts: existing.pending_prompts || 0,
       prompts: existingPrompts,
@@ -44,6 +68,9 @@ export class SessionStore {
       delivered_layout_warning_keys: existing.delivered_layout_warning_keys || [],
       dom_snapshot: existing.dom_snapshot || "",
       chat: existing.chat || [],
+      // First-open time. Unlike `updated_at` this is never bumped by prompts, feedback, or a
+      // re-open, so the session index can show (and prune by) how old a session really is.
+      opened_at: existing.opened_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
     state.sessions[key] = session;
@@ -205,6 +232,31 @@ export async function canonicalFile(file) {
 
 export function sessionKey(file) {
   return crypto.createHash("sha256").update(file).digest("hex").slice(0, 16);
+}
+
+// Readable stem for a session URL: "~/plans/Q3 Roadmap.html" -> "q3-roadmap". Only the file
+// name participates, so the slug stays short enough to read in a browser address bar.
+export function slugForFile(file) {
+  const base = path
+    .basename(String(file || ""))
+    .toLowerCase()
+    .replace(/\.html?$/, "");
+  const slug = base.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "session";
+}
+
+// Two artifacts in different folders can share a file name, so a taken base gets -2, -3, ...
+// The session re-minting its own base keeps it (its own key is excluded from the conflict scan).
+export function uniqueSlug(base, key, sessions) {
+  const taken = new Set(
+    Object.values(sessions || {})
+      .filter((session) => session && session.key !== key && session.slug)
+      .map((session) => session.slug),
+  );
+  if (!taken.has(base)) return base;
+  let suffix = 2;
+  while (taken.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
 }
 
 function normalizePrompt(prompt) {
