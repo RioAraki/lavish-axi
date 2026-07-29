@@ -23,6 +23,7 @@
     "lint": "eslint bin src test scripts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "reload": "node scripts/reload.js",
     "prepack": "npm run build",
     "prepare": "npm run build",
     "test": "node --test",
