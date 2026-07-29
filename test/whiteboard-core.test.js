@@ -4,9 +4,12 @@ import test from "node:test";
 import {
   createWhiteboardPersistencePayload,
   findDuplicateElementIds,
+  formalizeSceneElements,
+  FORMAL_FONT_FAMILY,
   normalizeExcalidrawSceneTarget,
   repairSavedSceneTextMetrics,
   sanitizeSceneLink,
+  sceneHasUserEdits,
   sceneIsImageFallback,
   summarizeSceneEdits,
   SUMMARY_MAX_LINE_CHARS,
@@ -244,4 +247,74 @@ test("normalizeExcalidrawSceneTarget coerces hostile values to bounded safe ones
   assert.equal(out.scenePath, "");
   assert.equal(out.imageFallback, false);
   assert.deepEqual(out.stats, { added: 0, removed: 10_000, moved: 0, relabeled: 3, drawn: 0 });
+});
+
+test("formalizeSceneElements flattens hand-drawn style without touching geometry or colors", () => {
+  const elements = [
+    {
+      ...rect("a", { roughness: 1, fillStyle: "hachure" }),
+      strokeColor: "#1971c2",
+      backgroundColor: "#a5d8ff",
+      strokeWidth: 2,
+    },
+    { id: "b", type: "text", text: "Hello", x: 5, y: 6, width: 40, height: 20, fontFamily: 5, fontSize: 16 },
+  ];
+  const snapshot = JSON.parse(JSON.stringify(elements));
+
+  const formal = formalizeSceneElements(elements);
+
+  assert.equal(formal[0].roughness, 0);
+  assert.equal(formal[0].fillStyle, "solid");
+  assert.equal(formal[0].strokeColor, "#1971c2");
+  assert.equal(formal[0].backgroundColor, "#a5d8ff");
+  assert.equal(formal[0].strokeWidth, 2);
+  assert.deepEqual(
+    { x: formal[0].x, y: formal[0].y, width: formal[0].width, height: formal[0].height },
+    { x: 0, y: 0, width: 100, height: 40 },
+  );
+  assert.equal(formal[1].fontFamily, FORMAL_FONT_FAMILY);
+  assert.equal(formal[1].fontSize, 16);
+  // Input is never mutated, and the copies are fresh objects.
+  assert.deepEqual(elements, snapshot);
+  assert.notEqual(formal[0], elements[0]);
+});
+
+test("formalizeSceneElements only overrides props the element already carries", () => {
+  const [formal] = formalizeSceneElements([{ id: "a", type: "image", x: 0, y: 0 }]);
+
+  assert.deepEqual(formal, { id: "a", type: "image", x: 0, y: 0 });
+  assert.equal(Object.hasOwn(formal, "roughness"), false);
+  assert.equal(Object.hasOwn(formal, "fillStyle"), false);
+  assert.equal(Object.hasOwn(formal, "fontFamily"), false);
+});
+
+test("formalizeSceneElements leaves non-object entries and non-array input alone", () => {
+  assert.deepEqual(formalizeSceneElements([null, "nope", 7]), [null, "nope", 7]);
+  assert.deepEqual(formalizeSceneElements(null), []);
+  assert.deepEqual(formalizeSceneElements(undefined), []);
+});
+
+test("sceneHasUserEdits ignores style-only differences from the baseline", () => {
+  const baseline = [rect("a", { roughness: 1, fillStyle: "hachure" }), boundLabel("a-text", "a", "Start")];
+  const restyled = [rect("a", { roughness: 0, fillStyle: "solid" }), boundLabel("a-text", "a", "Start")];
+
+  assert.equal(sceneHasUserEdits(baseline, baseline), false);
+  assert.equal(sceneHasUserEdits(baseline, restyled), false);
+});
+
+test("sceneHasUserEdits reports structural edits", () => {
+  const baseline = [rect("a"), boundLabel("a-text", "a", "Start")];
+
+  assert.equal(sceneHasUserEdits(baseline, [...baseline, rect("b", { x: 400 })]), true);
+  assert.equal(sceneHasUserEdits(baseline, [rect("a", { x: 200 }), boundLabel("a-text", "a", "Start")]), true);
+  assert.equal(sceneHasUserEdits(baseline, [rect("a"), boundLabel("a-text", "a", "Renamed")]), true);
+  assert.equal(sceneHasUserEdits(baseline, []), true);
+});
+
+test("sceneHasUserEdits treats a missing baseline as edited so the scene is preserved", () => {
+  const scene = [rect("a"), boundLabel("a-text", "a", "Start")];
+
+  assert.equal(sceneHasUserEdits(undefined, scene), true);
+  assert.equal(sceneHasUserEdits(null, scene), true);
+  assert.equal(sceneHasUserEdits([], scene), true);
 });

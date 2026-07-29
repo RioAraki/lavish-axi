@@ -33,9 +33,11 @@ import {
   convertExcalidrawSkeletonsAfterFontsLoad,
   createWhiteboardPersistencePayload,
   findDuplicateElementIds,
+  formalizeSceneElements,
   repairSavedSceneTextMetrics,
   sanitizeSceneLink,
   sanitizeWhiteboardAppState,
+  sceneHasUserEdits,
   sceneIsImageFallback,
   summarizeSceneEdits,
   WHITEBOARD_TEXT_METRICS_VERSION,
@@ -438,12 +440,15 @@ async function convertSource(source) {
     }
     return elements;
   };
-  const elements = await convertExcalidrawSkeletonsAfterFontsLoad(skeletons, {
+  let elements = await convertExcalidrawSkeletonsAfterFontsLoad(skeletons, {
     convert: materialize,
     loadFonts: async (fallbackElements) => {
       await loadSceneFonts(fallbackElements, files);
     },
   });
+  // Fresh conversions only. A saved scene keeps whatever style the user last edited, so
+  // formalizing here never overwrites a deliberate hand-drawn choice.
+  elements = formalizeSceneElements(elements);
   return { elements, files: files || {}, imageFallback: sceneIsImageFallback(elements) };
 }
 
@@ -614,6 +619,14 @@ async function handleInit(init) {
       return;
     }
     if (saved.source_hash === init.sourceHash) {
+      // Scenes are auto-saved on first view, so a diagram converted before the formal style
+      // landed would replay its old hand-drawn scene forever. When the saved scene is
+      // structurally identical to its conversion baseline nothing of the user's is at stake -
+      // re-convert so it picks up the current style. Hand-edited scenes replay as saved.
+      if (!sceneHasUserEdits(saved.baseline?.elements, saved.scene?.elements)) {
+        await startFromConversion({ ...init, theme });
+        return;
+      }
       await startFromSavedScene({ ...init, saved, theme });
       return;
     }

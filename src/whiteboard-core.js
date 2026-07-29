@@ -13,6 +13,26 @@ export const SUMMARY_MAX_LINE_CHARS = 200;
 const SUMMARY_MOVE_EPSILON_PX = 2;
 const STAT_KEYS = ["added", "removed", "moved", "relabeled", "drawn"];
 
+// Excalidraw's FONT_FAMILY.Normal (Helvetica). The converter's hand-drawn default is
+// Excalifont, which reads as a sketch rather than a diagram.
+export const FORMAL_FONT_FAMILY = 2;
+
+// Mermaid conversions inherit Excalidraw's hand-drawn defaults - rough strokes, hachure
+// fills, handwriting font - which look drafty and hurt legibility for diagrams meant to be
+// read. Flatten those three style props while preserving geometry and whatever colors the
+// converter (or the diagram's own theme) chose. Props the element does not already carry are
+// never introduced, so non-shape elements stay untouched.
+export function formalizeSceneElements(elements) {
+  return (Array.isArray(elements) ? elements : []).map((element) => {
+    if (!element || typeof element !== "object" || Array.isArray(element)) return element;
+    const formal = { ...element };
+    if (Object.hasOwn(formal, "roughness")) formal.roughness = 0;
+    if (Object.hasOwn(formal, "fillStyle")) formal.fillStyle = "solid";
+    if (Object.hasOwn(formal, "fontFamily")) formal.fontFamily = FORMAL_FONT_FAMILY;
+    return formal;
+  });
+}
+
 export function sanitizeWhiteboardAppState(appState) {
   if (!appState || typeof appState !== "object" || Array.isArray(appState)) return {};
   const safeAppState = { ...appState };
@@ -244,6 +264,15 @@ export function summarizeSceneEdits(baselineElements, editedElements, { maxLines
   }
   if (total === 0) bounded.push("No element changes detected (view-only or style-only edits).");
   return { lines: bounded, stats, totalChanges: total };
+}
+
+// True when a saved scene structurally differs from the baseline it was converted from -
+// elements added, removed, moved, resized, relabeled, or drawn on. Style-only differences are
+// not structural changes, so a scene that was only auto-saved (never touched) reports false and
+// callers may safely re-convert it. A missing baseline can't be diffed against, so every saved
+// element reads as added and the scene is preserved as edited.
+export function sceneHasUserEdits(baselineElements, sceneElements) {
+  return summarizeSceneEdits(baselineElements, sceneElements).totalChanges > 0;
 }
 
 function capitalize(text) {
