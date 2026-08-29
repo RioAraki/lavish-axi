@@ -11,7 +11,6 @@ import {
   createWhiteboardChannelToken,
   createWhiteboardFrameHtml,
   isValidWhiteboardChannelToken,
-  isWhiteboardWriteApiPath,
   serve,
 } from "../src/server.js";
 import { mermaidSourceHash } from "../src/mermaid-source.js";
@@ -21,11 +20,8 @@ const ARTIFACT_HTML = `<!doctype html><html><body>
 <pre class="mermaid">flowchart TD
   A[Start] --&gt; B{Ready?}</pre>
 <pre class="mermaid">sequenceDiagram
-  CLI-&gt;&gt;Server: poll</pre>
+  CLI-&gt;&gt;Server: render</pre>
 </body></html>`;
-
-const PNG_DATA_URL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
 async function startWhiteboardServer() {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-wb-server-"));
@@ -60,15 +56,6 @@ async function startWhiteboardServer() {
     },
   };
 }
-
-test("isWhiteboardWriteApiPath matches only whiteboard write routes", () => {
-  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/0"), true);
-  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/12/feedback-files"), true);
-  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/prompts"), false);
-  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/9999"), false);
-  assert.equal(isWhiteboardWriteApiPath("/api/BAD/whiteboard/0"), false);
-  assert.equal(isWhiteboardWriteApiPath("/whiteboard-frame"), false);
-});
 
 test("createWhiteboardFrameHtml loads only whiteboard-assets resources", () => {
   const html = createWhiteboardFrameHtml("channel-token");
@@ -110,64 +97,7 @@ test("GET /api/:key/mermaid-sources extracts ordered, entity-decoded sources wit
     assert.equal(data.sources[0].index, 0);
     assert.equal(data.sources[0].source, "flowchart TD\n  A[Start] --> B{Ready?}");
     assert.equal(data.sources[0].hash, mermaidSourceHash("flowchart TD\n  A[Start] --> B{Ready?}"));
-    assert.equal(data.sources[1].source, "sequenceDiagram\n  CLI->>Server: poll");
-  } finally {
-    await ctx.close();
-  }
-});
-
-test("whiteboard scene round-trips through PUT and GET", async () => {
-  const ctx = await startWhiteboardServer();
-  try {
-    const empty = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`).then((res) => res.json());
-    assert.equal(empty.whiteboard, null);
-
-    const scene = { elements: [{ id: "A", type: "rectangle" }], appState: { theme: "dark" }, files: {} };
-    const put = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
-      method: "PUT",
-      headers: ctx.sameOrigin,
-      body: JSON.stringify({
-        source_hash: "hash-1",
-        text_metrics_version: 1,
-        scene,
-        baseline: { elements: scene.elements },
-      }),
-    });
-    assert.equal(put.status, 200);
-
-    const loaded = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`).then((res) => res.json());
-    assert.equal(loaded.whiteboard.source_hash, "hash-1");
-    assert.equal(loaded.whiteboard.text_metrics_version, 1);
-    assert.deepEqual(loaded.whiteboard.scene, { ...scene, appState: {} });
-    assert.deepEqual(loaded.whiteboard.baseline, { elements: scene.elements });
-  } finally {
-    await ctx.close();
-  }
-});
-
-test("whiteboard write routes reject cross-origin and unknown sessions", async () => {
-  const ctx = await startWhiteboardServer();
-  try {
-    const crossOrigin = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
-      method: "PUT",
-      headers: { "content-type": "application/json", origin: "https://evil.example" },
-      body: JSON.stringify({ source_hash: "x", scene: null }),
-    });
-    assert.equal(crossOrigin.status, 403);
-
-    const noOrigin = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source_hash: "x", scene: null }),
-    });
-    assert.equal(noOrigin.status, 403);
-
-    const missingSession = await fetch(`${ctx.base}/api/ffffffffffffffff/whiteboard/0`, {
-      method: "PUT",
-      headers: ctx.sameOrigin,
-      body: JSON.stringify({ source_hash: "x", scene: null }),
-    });
-    assert.equal(missingSession.status, 404);
+    assert.equal(data.sources[1].source, "sequenceDiagram\n  CLI->>Server: render");
   } finally {
     await ctx.close();
   }
@@ -193,54 +123,6 @@ test("whiteboard channel authentication accepts only the frame-issued token", as
       body: JSON.stringify({ token: "forged" }),
     });
     assert.equal(rejected.status, 403);
-  } finally {
-    await ctx.close();
-  }
-});
-
-test("feedback-files writes the .excalidraw and PNG sidecars and returns their paths", async () => {
-  const ctx = await startWhiteboardServer();
-  try {
-    const response = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/1/feedback-files`, {
-      method: "POST",
-      headers: ctx.sameOrigin,
-      body: JSON.stringify({
-        scene: { elements: [{ id: "B", type: "ellipse" }], appState: {}, files: {} },
-        pngDataUrl: PNG_DATA_URL,
-      }),
-    });
-    assert.equal(response.status, 200);
-    const { scene_path, preview_path } = await response.json();
-    assert.ok(scene_path.endsWith(`${path.sep}whiteboards${path.sep}${ctx.key}${path.sep}1.excalidraw`));
-    const sceneFile = JSON.parse(await readFile(scene_path, "utf8"));
-    assert.equal(sceneFile.type, "excalidraw");
-    assert.equal(sceneFile.elements[0].id, "B");
-    const png = await readFile(preview_path);
-    assert.deepEqual([...png.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
-  } finally {
-    await ctx.close();
-  }
-});
-
-test("whiteboard write routes accept payloads beyond the default 2mb JSON cap", async () => {
-  const ctx = await startWhiteboardServer();
-  try {
-    const bigText = "x".repeat(3 * 1024 * 1024);
-    const bigScene = { elements: [{ id: "big", type: "text", text: bigText }], appState: {}, files: {} };
-
-    const promptsResponse = await fetch(`${ctx.base}/api/${ctx.key}/prompts`, {
-      method: "POST",
-      headers: ctx.sameOrigin,
-      body: JSON.stringify({ prompts: [{ prompt: bigText, tag: "message" }] }),
-    });
-    assert.equal(promptsResponse.status, 413);
-
-    const whiteboardResponse = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
-      method: "PUT",
-      headers: ctx.sameOrigin,
-      body: JSON.stringify({ source_hash: "big", scene: bigScene }),
-    });
-    assert.equal(whiteboardResponse.status, 200);
   } finally {
     await ctx.close();
   }

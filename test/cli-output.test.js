@@ -22,72 +22,27 @@ import {
   createExportOutput,
   createHomeOutput,
   createOpenOutput,
-  createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
   createShareOutput,
-  createUserEndedOpenOutput,
-  detectInvokingAgent,
   fetchJson,
   getCommandHelp,
+  layoutAuditWaitMs,
   normalizeArgv,
-  pollInterruptedText,
-  pollWaitBannerText,
-  pollWaitTickText,
   resolveCopilotHookDir,
   resolveHookHomeDir,
   resolveServerEntry,
   shutdownServerOnPort,
   shouldForceRestartForLocalBuild,
   shouldKillProcessOnPort,
-  shouldNarratePollWaitTicks,
   shouldOpenBrowser,
   shouldRestartServer,
-  startPollWaitReporter,
   stopCommand,
   telemetryCommandName,
   VERSION,
 } from "../src/cli.js";
 import { DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "../src/design-reference.js";
 import { serve } from "../src/server.js";
-import { canonicalFile, sessionKey } from "../src/session-store.js";
-
-async function waitForPollListening(base, key, timeoutMs = 10_000) {
-  const controller = new AbortController();
-  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const deadline = Date.now() + timeoutMs;
-  try {
-    while (true) {
-      const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-      if (match) {
-        buffer = buffer.replace(match[0], "");
-        if (JSON.parse(match[1]).state === "listening") return;
-        continue;
-      }
-      const remaining = Math.max(1, deadline - Date.now());
-      let timer;
-      let value;
-      let done;
-      try {
-        ({ value, done } = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("timed out waiting for listening presence")), remaining);
-          }),
-        ]));
-      } finally {
-        clearTimeout(timer);
-      }
-      if (done) throw new Error("presence stream closed before listening");
-      buffer += decoder.decode(value, { stream: true });
-    }
-  } finally {
-    controller.abort();
-  }
-}
 
 function setupHooksEnv(homeDir, stateDir) {
   // eslint-disable-next-line no-unused-vars
@@ -95,35 +50,19 @@ function setupHooksEnv(homeDir, stateDir) {
   return { ...env, HOME: homeDir, LAVISH_AXI_STATE_DIR: stateDir };
 }
 
-function assertObservablePollWakePath(text) {
-  assert.match(text, /Keep the poll in the foreground by default/i);
-  assert.match(text, /return the feedback directly to the agent/i);
-  assert.match(text, /harness-native tracked background-job facility/i);
-  assert.match(text, /guaranteed to resume or notify the same agent/i);
-  assert.match(text, /Never use `nohup`/);
-  assert.match(text, /shell `&`/);
-  assert.match(text, /`disown`/);
-  assert.match(text, /redirected fire-and-forget processes/);
-  assert.match(text, /detached terminal without an explicit verified callback/);
-  assert.match(text, /no completion-aware background facility/i);
-  assert.match(text, /verified wake callback into the surrounding supervisor/i);
-  assert.match(text, /Do not tell the user the artifact is being monitored until that wake path is live/i);
-  assert.doesNotMatch(text, /foreground command may run.*run the poll as a background task/i);
-}
-
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(VERSION, packageJson.version);
 });
 
-test("home output teaches agents when and how to use Lavish Editor", () => {
+test("home output teaches agents when and how to use Lavish", () => {
   const output = createHomeOutput({ bin: `${os.homedir()}/.local/bin/lavish-axi`, sessions: [] });
 
   assert.equal(output.bin, "~/.local/bin/lavish-axi");
-  assert.match(output.description, /Lavish Editor/);
-  assert.match(output.description, /complex response/);
-  assert.match(output.description, /consider using Lavish Editor/);
-  assert.match(output.description, /First generate an interactive HTML artifact/);
+  assert.match(output.description, /Lavish turns an agent's complex or visual response/);
+  assert.match(output.description, /displayed in the user's browser/);
+  assert.match(output.description, /returns immediately/);
+  assert.match(output.description, /display surface, not a feedback channel/);
   assert.deepEqual(output.sessions, []);
   assert.equal("use_cases" in output, false);
   assert.equal("example_use_cases" in output, false);
@@ -180,50 +119,6 @@ test("the design-priority rule is single-sourced and keeps its three-step semant
   assert.match(DESIGN_SYSTEM_HINT, /state which of the three design sources/);
 });
 
-test("home output warns agents that poll needs an observable wake path", () => {
-  const output = createHomeOutput({ bin: "lavish-axi", sessions: [] });
-  const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
-
-  assert.ok(pollHelp, "home help mentions the poll command");
-  assert.match(pollHelp, /long-poll/);
-  assert.match(pollHelp, /stays silent/);
-  assert.match(pollHelp, /never kill it/);
-  assertObservablePollWakePath(pollHelp);
-  assert.doesNotMatch(pollHelp, /Codex/);
-  assert.match(pollHelp, /re-run/);
-  assert.match(pollHelp, /queued feedback is never lost/);
-  assert.match(pollHelp, /`Send & End` ends the session/);
-  assert.match(pollHelp, /final feedback is still delivered once/);
-  assert.doesNotMatch(pollHelp, /above 10 minutes/);
-});
-
-test("home output tailors poll guidance when invoked under Codex", () => {
-  const output = createHomeOutput({ bin: "lavish-axi", sessions: [], agent: "codex" });
-  const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
-
-  assertObservablePollWakePath(pollHelp);
-  assert.match(pollHelp, /Codex detected/);
-  assert.match(pollHelp, /keep the poll attached to the active turn/);
-});
-
-test("home output keeps static skill poll guidance safe and agent-neutral", () => {
-  const output = createHomeOutput({ bin: "lavish-axi", sessions: [], agent: "static" });
-  const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
-
-  assertObservablePollWakePath(pollHelp);
-  assert.doesNotMatch(pollHelp, /keep the poll attached to the active turn/i);
-  assert.doesNotMatch(pollHelp, /Codex detected/);
-  assert.match(pollHelp, /queued feedback is never lost/);
-});
-
-test("invoking agent detection recognizes Codex runtime markers only", () => {
-  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_SANDBOX: "seatbelt" }), "codex");
-  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_THREAD_ID: "thread" }), "codex");
-  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_HOME: "/tmp/codex" }), "generic");
-  assert.equal(detectInvokingAgent({ PATH: "/bin", CODEX_EXPERIMENTAL_FEATURE: "1" }), "generic");
-  assert.equal(detectInvokingAgent({ PATH: "/bin" }), "generic");
-});
-
 test("top-level help renders static home output without dynamic sessions", async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-help-test-`);
   try {
@@ -245,8 +140,8 @@ test("top-level help renders static home output without dynamic sessions", async
     assert.match(result.stdout, /Tailwind CSS browser runtime v4/);
     assert.match(result.stdout, /lavish-axi design/);
     assert.match(result.stdout, /strict priority order/);
-    assert.match(result.stdout, /never kill it/);
-    assert.match(result.stdout, /queued feedback is never lost/);
+    assert.match(result.stdout, /nothing to poll, subscribe to, or wait for/);
+    assert.doesNotMatch(result.stdout, /never kill it/);
     assert.doesNotMatch(result.stdout, /above 10 minutes/);
     assert.doesNotMatch(result.stdout, /lavish-design/);
     assert.doesNotMatch(result.stdout, /sessions\[/);
@@ -648,7 +543,7 @@ test("home directory collapse tolerates Windows mixed separators", () => {
   );
 });
 
-test("open output keeps the user URL in session data and next_step focused on polling", () => {
+test("a clean open tells the agent the work is done and to keep talking here", () => {
   const output = createOpenOutput({
     file: "/tmp/artifact.html",
     url: "http://localhost:4387/session/abc123",
@@ -658,48 +553,41 @@ test("open output keeps the user URL in session data and next_step focused on po
   assert.equal(output.session.file, "/tmp/artifact.html");
   assert.equal(output.session.url, "http://localhost:4387/session/abc123");
   assert.equal(output.session.status, "opened");
-  // Keyword-level lock on the load-bearing semantics of this agent-facing string:
-  // poll now (not the user-facing URL), never kill the poll, no --timeout-ms, and the
-  // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
-  assert.doesNotMatch(output.next_step, /Tell the user (?:to open|to visit)/i);
-  assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
-  assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
-  assert.match(output.next_step, /layout_warnings/);
-  assert.match(output.next_step, /never kill it/);
-  assertObservablePollWakePath(output.next_step);
-  assert.doesNotMatch(output.next_step, /Codex/);
-  assert.match(output.next_step, /queued feedback is never lost/);
-  assert.match(output.next_step, /Do not pass --timeout-ms/);
-  assert.match(output.next_step, /If the user ends the session, stop polling and do not reopen it/);
-  assert.match(output.next_step, /--reopen/);
+  assert.equal(output.layout_warnings, undefined);
+  // Keyword-level lock on the load-bearing semantics of this agent-facing string: the task
+  // is finished, there is nothing to wait on, and the reply happens in the conversation.
+  assert.match(output.next_step, /nothing to poll or wait for/i);
+  assert.match(output.next_step, /reply to you in this conversation/i);
+  assert.match(output.next_step, /live-reloads/);
+  assert.doesNotMatch(output.next_step, /lavish-axi poll/);
+  assert.doesNotMatch(output.next_step, /--reopen|--timeout-ms|Do not respond to the user just yet/);
 });
 
-test("open output gives Codex the shared wake-path contract plus an attached-turn warning", () => {
+test("an open carrying severe layout failures demands a repair and re-check first", () => {
   const output = createOpenOutput({
     file: "/tmp/artifact.html",
     url: "http://localhost:4387/session/abc123",
     status: "opened",
-    agent: "codex",
+    layoutWarnings: [
+      { selector: "main", kind: "text-clipped", severity: "error" },
+      { selector: "aside", kind: "cosmetic", severity: "warning" },
+    ],
   });
 
-  assertObservablePollWakePath(output.next_step);
-  assert.match(output.next_step, /Codex detected/);
-  assert.match(output.next_step, /keep the poll attached to the active turn/);
+  // Only proven severe findings reach the agent; softer observations fail open.
+  assert.deepEqual(output.layout_warnings, [{ selector: "main", kind: "text-clipped", severity: "error" }]);
+  assert.match(output.next_step, /1 proven severe layout failure -/);
+  assert.match(output.next_step, /Repair it, then run `lavish-axi \/tmp\/artifact\.html` again/);
+  assert.doesNotMatch(output.next_step, /nothing to poll/);
 });
 
-test("a user-ended open refuses with a status agents can branch on, not a URL to open", () => {
-  const output = createUserEndedOpenOutput({
-    file: "/tmp/artifact.html",
-    url: "http://localhost:4387/session/abc123",
-  });
-
-  assert.equal(output.session.file, "/tmp/artifact.html");
-  assert.equal(output.session.status, "user-ended");
-  assert.match(output.next_step, /user explicitly ended this Lavish Editor session from the browser/);
-  assert.match(output.next_step, /did not reopen it/);
-  assert.match(output.next_step, /Do not reopen unless the user asks for further review/);
-  assert.match(output.next_step, /lavish-axi \/tmp\/artifact\.html --reopen/);
+test("layoutAuditWaitMs uses the server default unless explicitly configured", () => {
+  assert.equal(layoutAuditWaitMs({}), null);
+  assert.equal(layoutAuditWaitMs({ LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS: "  " }), null);
+  assert.equal(layoutAuditWaitMs({ LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS: "nonsense" }), null);
+  assert.equal(layoutAuditWaitMs({ LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS: "2500" }), 2500);
+  assert.equal(layoutAuditWaitMs({ LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS: "0" }), 0);
+  assert.equal(layoutAuditWaitMs({ LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS: "off" }), 0);
 });
 
 test("export output reports the written file and reassures it needs no server", () => {
@@ -1004,30 +892,6 @@ test("share command treats a whitespace-only password as public", async () => {
   }
 });
 
-test("poll help requires an observable wake path", () => {
-  const help = getCommandHelp("poll");
-
-  assert.match(help, /long-polls indefinitely/);
-  assert.match(help, /stays silent/);
-  assert.match(help, /never kill it/);
-  assertObservablePollWakePath(help);
-  assert.doesNotMatch(help, /Codex/);
-  assert.match(help, /queued feedback is never lost/);
-  assert.match(help, /Do not pass --timeout-ms/);
-  assert.match(help, /tests and debugging only/);
-  assert.match(help, /`Send & End` ends the session/);
-  assert.match(help, /final feedback is still delivered once/);
-  assert.doesNotMatch(help, /above 10 minutes/);
-});
-
-test("poll help is Codex-aware when requested", () => {
-  const help = getCommandHelp("poll", { agent: "codex" });
-
-  assertObservablePollWakePath(help);
-  assert.match(help, /Codex detected/);
-  assert.match(help, /keep the poll attached to the active turn/);
-});
-
 test("share help distinguishes public default from password-protected shares", () => {
   const help = getCommandHelp("share");
   const home = createHomeOutput({ bin: "lavish-axi", sessions: [] });
@@ -1045,447 +909,11 @@ test("share help distinguishes public default from password-protected shares", (
   assert.doesNotMatch(homeShareHelp, /Everything published is public/);
 });
 
-test("feedback next step keeps the next poll completion observable", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: { status: "feedback", dom_snapshot: "", prompts: [] },
-  });
-
-  assert.equal("layout_warnings" in output, false);
-  assert.match(output.next_step, /never kill it/);
-  assert.match(output.next_step, /without --timeout-ms/);
-  assertObservablePollWakePath(output.next_step);
-  assert.doesNotMatch(output.next_step, /Codex/);
-  assert.match(output.next_step, /queued feedback is never lost/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
-  assert.match(output.next_step, /fresh layout_warnings/);
-  assert.doesNotMatch(output.next_step, /above 10 minutes/);
-});
-
-test("feedback next step is Codex-aware when requested", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: { status: "feedback", dom_snapshot: "", prompts: [] },
-    agent: "codex",
-  });
-
-  assertObservablePollWakePath(output.next_step);
-  assert.match(output.next_step, /Codex detected/);
-  assert.match(output.next_step, /keep the poll attached to the active turn/);
-});
-
-test("layout warning feedback tells agents to fix layout before involving the human", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: "html",
-          kind: "page-horizontal-overflow",
-          overflowPx: 16,
-          viewportWidth: 720,
-          severity: "error",
-        },
-      ],
-    },
-  });
-
-  assert.ok("layout_warnings" in output);
-  assert.equal(output.layout_warnings.length, 1);
-  assert.match(output.next_step, /1 proven severe layout failure detected/);
-  assert.match(output.next_step, /repair the inaccessible or unusable content/);
-  assert.match(output.next_step, /before involving the human/);
-  assert.doesNotMatch(output.next_step, /reload or re-open/);
-});
-
-test("whiteboard feedback tells agents to read the summary, inspect files when needed, and update the Mermaid source", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [
-        {
-          uid: "",
-          prompt: "Whiteboard edits to diagram 1:\nMoved rectangle (Auth)",
-          selector: "",
-          tag: "whiteboard",
-          text: "Whiteboard: diagram 1",
-          target: {
-            type: "excalidraw-scene",
-            diagramIndex: 0,
-            diagramId: "mermaid-1",
-            sourceHash: "abc",
-            scenePath: "/state/whiteboards/k/0.excalidraw",
-            previewPath: "/state/whiteboards/k/0.png",
-            imageFallback: false,
-            stats: { added: 0, removed: 0, moved: 1, relabeled: 0, drawn: 0 },
-          },
-        },
-      ],
-    },
-  });
-
-  assert.match(output.next_step, /whiteboard edits \(tag "whiteboard"\)/);
-  assert.match(output.next_step, /read the edit summary in the prompt text first/);
-  assert.match(output.next_step, /scenePath/);
-  assert.match(output.next_step, /previewPath/);
-  assert.match(output.next_step, /Mermaid source stays authoritative/);
-  assert.match(output.next_step, /never try to write the \.excalidraw scene back/);
-});
-
-test("non-whiteboard feedback does not mention whiteboard guidance", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [{ uid: "", prompt: "Tighten this", selector: "h1", tag: "h1", text: "Title" }],
-    },
-  });
-
-  assert.doesNotMatch(output.next_step, /whiteboard/i);
-});
-
-test("a poll reporting the session ended by the user tells the agent to stop and not reopen", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: { status: "ended", ended_by: "user" },
-  });
-
-  assert.equal(output.session.status, "ended");
-  assert.equal(output.session.ended_by, "user");
-  assert.match(output.next_step, /user ended this Lavish Editor session/);
-  assert.match(output.next_step, /Stop polling/);
-  assert.match(output.next_step, /do not run `lavish-axi \/tmp\/report\.html` to reopen it/);
-  assert.match(output.next_step, /deliver any remaining updates directly in this conversation/i);
-  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html --reopen/);
-});
-
-test("a poll reporting an agent-ended session allows a plain reopen if still needed", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: { status: "ended", ended_by: "agent" },
-  });
-
-  assert.equal(output.session.ended_by, "agent");
-  assert.match(output.next_step, /Stop polling/);
-  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html`\s+to open a fresh session/);
-  assert.doesNotMatch(output.next_step, /--reopen/);
-});
-
-test("the final feedback batch before a user end flags session_ended and skips the reopen instruction", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [{ uid: "", prompt: "Parting feedback", selector: "", tag: "message", text: "bye" }],
-      session_ended: true,
-      ended_by: "user",
-    },
-  });
-
-  assert.equal(output.session.session_ended, true);
-  assert.equal(output.session.ended_by, "user");
-  assert.match(output.next_step, /last feedback before the user ended the session/);
-  assert.match(output.next_step, /Stop polling \/tmp\/report\.html and do not reopen it/);
-  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html --reopen/);
-  assert.doesNotMatch(output.next_step, /reload or re-open/);
-});
-
-test("the final feedback batch before an agent end preserves ended_by and allows plain reopen", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [{ uid: "", prompt: "Parting feedback", selector: "", tag: "message", text: "bye" }],
-      session_ended: true,
-      ended_by: "agent",
-    },
-  });
-
-  assert.equal(output.session.session_ended, true);
-  assert.equal(output.session.ended_by, "agent");
-  assert.match(output.next_step, /last feedback before the Lavish Editor session ended/);
-  assert.match(output.next_step, /lavish-axi \/tmp\/report\.html`\s+to open a fresh session/);
-  assert.doesNotMatch(output.next_step, /--reopen/);
-  assert.doesNotMatch(output.next_step, /user ended this Lavish Editor session/);
-});
-
-test("final user-ended feedback still requires severe layout repair without reopening", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      prompts: [],
-      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
-      session_ended: true,
-      ended_by: "user",
-    },
-  });
-
-  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
-  assert.match(output.next_step, /open it directly at the affected viewport/);
-  assert.match(output.next_step, /without reopening this ended Lavish session/);
-  assert.doesNotMatch(output.next_step, /--reopen/);
-});
-
-test("final agent-ended feedback requires repair in a fresh audit session", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      prompts: [],
-      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
-      session_ended: true,
-      ended_by: "agent",
-    },
-  });
-
-  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
-  assert.match(output.next_step, /open a fresh session and re-check the real-browser audit/);
-});
-
-test("persistent severe layout failures still require repair before review", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: "html",
-          kind: "page-horizontal-overflow",
-          overflowPx: 120,
-          viewportWidth: 390,
-          severity: "error",
-          persistent: true,
-        },
-      ],
-    },
-  });
-
-  assert.match(output.next_step, /proven severe layout failure/);
-  assert.match(output.next_step, /before involving the human/);
-  assert.doesNotMatch(output.next_step, /fine to proceed/);
-});
-
-test("warning-only layout observations are omitted from poll output", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: ".accent",
-          kind: "element-parent-overflow",
-          overflowPx: 20,
-          viewportWidth: 720,
-          severity: "warning",
-          persistent: false,
-        },
-        {
-          selector: ".unproven",
-          kind: "clipped-text",
-          overflowPx: 200,
-          viewportWidth: 720,
-          persistent: false,
-        },
-      ],
-    },
-  });
-
-  assert.equal("layout_warnings" in output, false);
-  assert.doesNotMatch(output.next_step, /layout warning/);
-});
-
-test("a mix of fresh and persistent severe failures still mandates a fix pass", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: "html",
-          kind: "page-horizontal-overflow",
-          overflowPx: 16,
-          viewportWidth: 720,
-          severity: "error",
-          persistent: false,
-        },
-        {
-          selector: ".badge",
-          kind: "clipped-text",
-          overflowPx: 12,
-          viewportWidth: 720,
-          severity: "error",
-          persistent: true,
-        },
-      ],
-    },
-  });
-
-  assert.match(output.next_step, /2 proven severe layout failures detected/);
-  assert.match(output.next_step, /before involving the human/);
-});
-
-test("poll wait messages tell watching agents the silence is normal", () => {
-  const banner = pollWaitBannerText("/tmp/report.html");
-  assert.match(banner, /\[lavish-axi\]/);
-  assert.match(banner, /Long-polling for user feedback/);
-  assert.match(banner, /stays silent/);
-  assert.match(banner, /leave it running/i);
-  assert.match(banner, /queued feedback is never lost/);
-
-  const tick = pollWaitTickText(3 * 60_000);
-  assert.match(tick, /\[lavish-axi\]/);
-  assert.match(tick, /Still waiting for user feedback \(3m\)/);
-  assert.match(tick, /leave this running/i);
-
-  const interrupted = pollInterruptedText("/tmp/report.html");
-  assert.match(interrupted, /\[lavish-axi\]/);
-  assert.match(interrupted, /Poll interrupted/);
-  assert.match(interrupted, /user may still be reviewing/);
-  assert.match(interrupted, /lavish-axi poll \/tmp\/report\.html/);
-  assert.match(interrupted, /queued feedback is never lost/);
-});
-
-test("poll wait reporter writes a banner immediately and heartbeats on an interval", async () => {
-  const lines = [];
-  const reporter = startPollWaitReporter({
-    file: "/tmp/report.html",
-    write: (line) => {
-      lines.push(line);
-    },
-    intervalMs: 5,
-  });
-
-  try {
-    assert.equal(lines.length, 1);
-    assert.match(lines[0], /Long-polling for user feedback/);
-
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.ok(lines.length >= 2, "emits heartbeat lines while waiting");
-    assert.match(lines[1], /Still waiting for user feedback/);
-  } finally {
-    reporter.stop();
-  }
-
-  const countAfterStop = lines.length;
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(lines.length, countAfterStop, "stops heartbeating after stop()");
-});
-
-test("poll wait reporter still banners without ticks when narration is off", async () => {
-  const lines = [];
-  const reporter = startPollWaitReporter({
-    file: "/tmp/report.html",
-    write: (line) => {
-      lines.push(line);
-    },
-    intervalMs: 5,
-    narrateTicks: false,
-  });
-
-  try {
-    assert.equal(lines.length, 1, "the one-shot not-hung banner is unconditional");
-    assert.match(lines[0], /Long-polling for user feedback/);
-
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(lines.length, 1, "suppresses the recurring heartbeat lines");
-  } finally {
-    reporter.stop();
-  }
-});
-
-test("shouldNarratePollWaitTicks heartbeats only in an interactive terminal", () => {
-  assert.equal(shouldNarratePollWaitTicks({ isTTY: true }), true);
-  assert.equal(shouldNarratePollWaitTicks({ isTTY: undefined }), false);
-  assert.equal(shouldNarratePollWaitTicks({ isTTY: false }), false);
-});
-
-test("spawned poll with piped stderr banners once and leaves re-run guidance when killed", async () => {
-  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-wait-test-`);
-  const artifact = `${stateDir}/artifact.html`;
-  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
-  const server = await serve({ port: 0, stateFile: `${stateDir}/state.json`, version: VERSION });
-  const base = `http://127.0.0.1:${server.port}`;
-  try {
-    const sessionResponse = await fetch(`${base}/api/sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ file: artifact }),
-    });
-    assert.ok(sessionResponse.ok, "session opens");
-
-    const key = sessionKey(await canonicalFile(artifact));
-
-    const child = spawn(
-      process.execPath,
-      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "poll", artifact],
-      {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
-        env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
-      },
-    );
-
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    await waitForPollListening(base, key);
-    assert.equal(
-      stderr.match(/Long-polling for user feedback/g)?.length,
-      1,
-      "piped stderr still gets the one-shot not-hung banner",
-    );
-    assert.doesNotMatch(stderr, /Still waiting for user feedback/, "the banner carries no immediate wait tick");
-
-    // Wait for "close" rather than "exit": "exit" can fire while the final stderr chunk is
-    // still in flight, so asserting on stderr at "exit" races the guidance message.
-    const closed = new Promise((resolve) => child.on("close", (code, signal) => resolve({ code, signal })));
-    child.kill("SIGTERM");
-    await closed;
-
-    // Windows terminates Node child processes directly instead of delivering SIGTERM
-    // to the child process's JavaScript signal handler.
-    if (process.platform !== "win32") {
-      assert.match(stderr, /Poll interrupted/);
-      assert.match(stderr, /queued feedback is never lost/);
-    }
-  } finally {
-    await server.close();
-    await rm(stateDir, { force: true, recursive: true });
-  }
-});
-
-test("waiting next step reassures agents that re-running poll loses nothing", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: { status: "waiting" },
-  });
-
-  assert.match(output.next_step, /lavish-axi poll \/tmp\/report\.html/);
-  assert.match(output.next_step, /without --timeout-ms/);
-  assert.match(output.next_step, /queued feedback is never lost/);
-});
-
 test("html file arguments normalize to the hidden open command", () => {
   assert.deepEqual(normalizeArgv(["report.html"]), ["open", "report.html"]);
   assert.deepEqual(normalizeArgv(["--no-open", "report.html"]), ["open", "--no-open", "report.html"]);
   assert.deepEqual(normalizeArgv(["--no-gate", "report.html"]), ["open", "--no-gate", "report.html"]);
-  assert.deepEqual(normalizeArgv(["poll", "report.html"]), ["poll", "report.html"]);
+  assert.deepEqual(normalizeArgv(["export", "report.html"]), ["export", "report.html"]);
   assert.deepEqual(normalizeArgv(["setup", "hooks"]), ["setup", "hooks"]);
   assert.deepEqual(normalizeArgv(["playbook", "diagram"]), ["playbook", "diagram"]);
   assert.deepEqual(normalizeArgv(["design"]), ["design"]);
@@ -1620,8 +1048,8 @@ test("setup hooks exits with an error when hook installation fails", async () =>
 
 test("telemetry command names are anonymous and do not include file paths", () => {
   assert.equal(telemetryCommandName(["report.html"]), "open");
-  assert.equal(telemetryCommandName(["poll", "/tmp/secret/report.html"]), "poll");
-  assert.equal(telemetryCommandName(["end", "/tmp/secret/report.html"]), "end");
+  assert.equal(telemetryCommandName(["export", "/tmp/secret/report.html"]), "export");
+  assert.equal(telemetryCommandName(["share", "/tmp/secret/report.html"]), "share");
   assert.equal(telemetryCommandName(["playbook", "diagram"]), "playbook");
   assert.equal(telemetryCommandName(["design"]), "design");
   assert.equal(telemetryCommandName([]), "home");
@@ -1756,7 +1184,10 @@ test("open can resume a session without opening another browser window", () => {
   assert.equal(shouldOpenBrowser(["artifact.html"], {}), true);
   assert.match(getCommandHelp("open"), /--no-open/);
   assert.match(getCommandHelp("open"), /--no-gate/);
-  assert.match(getCommandHelp("open"), /--reopen/);
+  assert.match(getCommandHelp("open"), /LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS/);
+  assert.doesNotMatch(getCommandHelp("open"), /--reopen/);
+  assert.equal(getCommandHelp("poll"), null);
+  assert.equal(getCommandHelp("end"), null);
   assert.match(getCommandHelp("playbook"), /diagram/);
   assert.match(getCommandHelp("playbook"), /code/);
   assert.match(getCommandHelp("playbook"), /input/);
@@ -1771,22 +1202,9 @@ test("open can resume a session without opening another browser window", () => {
   assert.doesNotMatch(getCommandHelp("design"), /auto-injects/);
 });
 
-test("polling a file without an active session tells the agent to open it first", () => {
-  assert.throws(
-    () => createPollOutput({ file: "/tmp/report.html", response: { status: "missing" } }),
-    (error) => {
-      assert.ok(error instanceof AxiError);
-      assert.equal(error.code, "NOT_FOUND");
-      assert.match(error.message, /No active Lavish Editor session/);
-      assert.ok(error.suggestions.some((item) => item.includes("lavish-axi /tmp/report.html")));
-      return true;
-    },
-  );
-});
-
 test("network fetch failures become structured Lavish server errors", async () => {
   await assert.rejects(
-    () => fetchJson("http://127.0.0.1:1/api/poll"),
+    () => fetchJson("http://127.0.0.1:1/api/sessions"),
     (error) => {
       assert.ok(error instanceof AxiError);
       assert.equal(error.code, "SERVER_ERROR");

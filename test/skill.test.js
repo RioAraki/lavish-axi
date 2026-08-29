@@ -39,7 +39,7 @@ test("createSkillMarkdown handles explicit /lavish invocation arguments", () => 
 
 test("createSkillMarkdown mirrors the no-args home output", () => {
   const md = createSkillMarkdown();
-  const home = createHomeOutput({ bin: "lavish-axi", sessions: [], includeSessions: false, agent: "static" });
+  const home = createHomeOutput({ bin: "lavish-axi", sessions: [], includeSessions: false });
 
   assert.ok(md.includes(skillCommandText(home.description)), "includes the product description");
 
@@ -58,27 +58,18 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
   }
 });
 
-test("createSkillMarkdown requires an observable wake path for every poll", () => {
+test("createSkillMarkdown workflow ends at the open, with no feedback loop to keep alive", () => {
   const md = createSkillMarkdown();
   const workflow = md.slice(md.indexOf("## Workflow"), md.indexOf("## Visual guidance"));
 
-  assert.match(workflow, /Keep .*poll in the foreground by default.*return the feedback directly to the agent/i);
-  assert.match(workflow, /harness-native tracked background-job facility/i);
-  assert.match(workflow, /completion result is guaranteed to resume or notify the same agent/i);
-  assert.match(workflow, /Never use `nohup`/);
-  assert.match(workflow, /shell `&`/);
-  assert.match(workflow, /`disown`/);
-  assert.match(workflow, /redirected fire-and-forget processes/);
-  assert.match(workflow, /detached terminal without an explicit verified callback/);
-  assert.match(
-    workflow,
-    /If the harness has no completion-aware background facility, use the foreground poll or first wire a verified wake callback into the surrounding supervisor/i,
-  );
-  assert.match(workflow, /Do not tell the user the artifact is being monitored until that wake path is live/i);
-  assert.match(workflow, /`Send & End` ends the session.*final feedback is still delivered once.*polling stops/i);
-  assert.match(workflow, /(?:do|must) not reopen (?:it|the session) uninvited/i);
-  assert.match(workflow, /queued feedback is never lost/);
-  assert.doesNotMatch(md, /Codex detected/);
+  assert.match(workflow, /returns as soon as the page is open/i);
+  assert.match(workflow, /layout_warnings/);
+  assert.match(workflow, /re-run the command to re-check/i);
+  assert.match(workflow, /Lavish collects nothing/i);
+  assert.match(workflow, /replies to you in this conversation, not in the browser/i);
+  assert.match(workflow, /live-reloads/);
+  assert.match(workflow, /nothing to poll, watch, or keep alive/i);
+  assert.doesNotMatch(workflow, /lavish-axi poll|lavish-axi end|Send & End|nohup|disown|wake path/i);
 });
 
 test("createSkillMarkdown requires opening every matching playbook", () => {

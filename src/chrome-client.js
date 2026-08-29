@@ -1,32 +1,20 @@
 /* global EventSource, document, location, window */
 
+// The chrome around a displayed artifact: a thin top bar, the sandboxed artifact iframe,
+// the fullscreen diagram overlay, and the live-reload stream. It collects nothing - there
+// is no annotation, no composer, and no channel back to the agent beyond the one-shot
+// layout audit it forwards on the artifact's behalf.
+
 const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
-const queueStorageKey = "lavish-axi:queued:" + key;
-const internalQueueKeyField = "_lavishQueueKey";
-const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
-const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
-
-function isModeToggleHotkeyEvent(event) {
-  if (event.shiftKey || event.altKey) return false;
-  return Boolean(event.metaKey || event.ctrlKey) && String(event.key || "").toLowerCase() === MODE_TOGGLE_HOTKEY_KEY;
-}
 
 const frame = /** @type {HTMLIFrameElement} */ (document.getElementById("artifact"));
-const panelScroll = /** @type {HTMLDivElement} */ (document.getElementById("panelScroll"));
-const annotationPills = /** @type {HTMLDivElement} */ (document.getElementById("annotationPills"));
-const chatLog = /** @type {HTMLDivElement} */ (document.getElementById("chatLog"));
-const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("chatInput"));
-const sendButton = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
-const sendAndEndButton = /** @type {HTMLButtonElement} */ (document.getElementById("sendAndEnd"));
-const annotationSwitch = /** @type {HTMLButtonElement} */ (document.getElementById("annotation"));
 const moreWrap = /** @type {HTMLDivElement} */ (document.getElementById("moreWrap"));
 const moreButton = /** @type {HTMLButtonElement} */ (document.getElementById("moreButton"));
 const moreMenu = /** @type {HTMLDivElement} */ (document.getElementById("moreMenu"));
 const reloadArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("reloadArtifact"));
-const copySnapshotButton = /** @type {HTMLButtonElement} */ (document.getElementById("copySnapshot"));
 const exportArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("exportArtifact"));
 const shareArtifactButton = /** @type {HTMLButtonElement} */ (document.getElementById("shareArtifact"));
 const shareDialog = /** @type {HTMLDivElement} */ (document.getElementById("shareDialog"));
@@ -41,29 +29,20 @@ const shareUrlInput = /** @type {HTMLInputElement} */ (document.getElementById("
 const shareUpdateKeyInput = /** @type {HTMLInputElement} */ (document.getElementById("shareUpdateKey"));
 const copyShareUrlButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyShareUrl"));
 const copyUpdateKeyButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyUpdateKey"));
-const endButton = /** @type {HTMLButtonElement} */ (document.getElementById("end"));
 const copyPathButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyPath"));
 const copyHint = /** @type {HTMLSpanElement} */ (document.getElementById("copyHint"));
 const copyHintText = /** @type {HTMLSpanElement} */ (document.getElementById("copyHintText"));
-const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("presenceBanner"));
-const endedOverlay = /** @type {HTMLDivElement} */ (document.getElementById("endedOverlay"));
 const layoutGateOverlay = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateOverlay"));
 const layoutGateTitle = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateTitle"));
 const layoutGateCopy = /** @type {HTMLParagraphElement} */ (document.getElementById("layoutGateCopy"));
 const layoutGateAction = /** @type {HTMLButtonElement} */ (document.getElementById("layoutGateAction"));
 const layoutIssueBanner = /** @type {HTMLDivElement} */ (document.getElementById("layoutIssueBanner"));
-const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
 const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardError"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
-const queued = loadQueuedPrompts();
-let annotation = true;
-let ended = false;
-let agentPresence = "waiting";
-let pendingSnapshot = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -76,98 +55,9 @@ let layoutGateManuallyBypassed = !layoutGateEnabled;
 let layoutGateCycle = 0;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let layoutGateTimer;
-const snapshotRequests = [];
-let endAfterSubmit = false;
-let workingBubble = null;
-let submitQueuedPromise = null;
-let submitQueuedAgain = false;
 let lastScroll = { x: 0, y: 0 };
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let copyHintTimer;
-/** @type {ReturnType<typeof setTimeout> | undefined} */
-let sendHintTimer;
-
-function escapeHtml(value) {
-  return String(value).replace(
-    /[&<>"']/g,
-    (char) =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;",
-      })[char],
-  );
-}
-
-function loadQueuedPrompts() {
-  try {
-    const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
-    return Array.isArray(parsed) ? parsed.filter((prompt) => prompt && typeof prompt === "object") : [];
-  } catch {
-    return [];
-  }
-}
-
-function persistQueuedPrompts() {
-  try {
-    if (queued.length) {
-      sessionStorage.setItem(queueStorageKey, JSON.stringify(queued));
-    } else {
-      sessionStorage.removeItem(queueStorageKey);
-    }
-  } catch {
-    // The in-memory queue still works if browser storage is unavailable.
-  }
-}
-
-function render() {
-  annotationPills.innerHTML = queued
-    .map(
-      (prompt, index) =>
-        '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(prompt.prompt) +
-        '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
-        index +
-        '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
-        (prompt.selector
-          ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
-            escapeHtml(prompt.selector) +
-            "</div>"
-          : "") +
-        '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
-        escapeHtml(prompt.prompt) +
-        "</div></div></div>",
-    )
-    .join("");
-
-  for (const button of annotationPills.querySelectorAll(".pill-close")) {
-    const closeButton = /** @type {HTMLButtonElement} */ (button);
-    closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
-  }
-  updateSendState();
-  scrollPanelToBottom();
-}
-
-function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
-  sendAndEndButton.disabled = sendButton.disabled;
-}
-
-function showSendHint() {
-  sendHint.hidden = false;
-  clearTimeout(sendHintTimer);
-  sendHintTimer = setTimeout(() => {
-    sendHint.hidden = true;
-  }, 2600);
-  chatInput.focus();
-}
-
-function hideSendHint() {
-  clearTimeout(sendHintTimer);
-  sendHint.hidden = true;
-}
 
 function setMenuOpen(button, menu, open) {
   menu.hidden = !open;
@@ -204,181 +94,16 @@ async function copyText(text) {
   return true;
 }
 
-function addChat(role, text, shouldScroll = true) {
-  if (!text) return;
-
-  const el = document.createElement("div");
-  el.className = "bubble " + role;
-  el.innerHTML = "<small>" + (role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(text) + "</div>";
-  chatLog.appendChild(el);
-  if (shouldScroll) scrollElementIntoView(el);
-  return el;
-}
-
-function syncChat(chat) {
-  for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working)")]) {
-    el.remove();
-  }
-
-  let lastChatBubble = null;
-  for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
-  if (workingBubble) {
-    chatLog.appendChild(workingBubble);
-    scrollElementIntoView(workingBubble);
-  } else if (lastChatBubble) {
-    scrollElementIntoView(lastChatBubble);
-  }
-}
-
-function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "working" ? state : "waiting";
-  updateSendState();
-  if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
-
-  if (agentPresence !== "working") {
-    if (workingBubble) workingBubble.remove();
-    workingBubble = null;
-    return;
-  }
-
-  if (!workingBubble) {
-    workingBubble = document.createElement("div");
-    workingBubble.className = "bubble agent agent-working";
-    workingBubble.innerHTML = '<span class="spinner"></span><span>Working...</span>';
-    chatLog.appendChild(workingBubble);
-  }
-  scrollElementIntoView(workingBubble);
-}
-
-function scrollPanelToBottom() {
-  panelScroll.scrollTop = panelScroll.scrollHeight;
-}
-
-function scrollElementIntoView(el) {
-  el.scrollIntoView({ block: "nearest", inline: "nearest" });
-}
-
-function removeQueuedPrompt(index, event) {
-  if (event) event.stopPropagation();
-  queued.splice(index, 1);
-  persistQueuedPrompts();
-  render();
-}
-
-function promptQueueKey(prompt) {
-  return prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
-}
-
-function enqueuePrompt(prompt) {
-  if (!prompt || typeof prompt !== "object") return;
-
-  const queueKey = promptQueueKey(prompt);
-  if (queueKey) {
-    const index = queued.findIndex((item) => promptQueueKey(item) === queueKey);
-    if (index !== -1) {
-      queued[index] = prompt;
-    } else {
-      queued.push(prompt);
-    }
-  } else {
-    queued.push(prompt);
-  }
-
-  persistQueuedPrompts();
-  render();
-}
-
-function stripInternalPromptFields(prompt) {
-  if (!prompt || typeof prompt !== "object") return prompt;
-  const clean = { ...prompt };
-  delete clean[internalQueueKeyField];
-  return clean;
-}
-
 function postToFrame(message) {
   if (frame.contentWindow) frame.contentWindow.postMessage(message, "*");
 }
 
-function requestSnapshot(action) {
-  snapshotRequests.push(action);
-  postToFrame({ type: "lavish:requestSnapshot" });
-}
-
-function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
-  closeMenus();
-
-  const text = chatInput.value.trim();
-  if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
-    persistQueuedPrompts();
-    addChat("user", text);
-    chatInput.value = "";
-    render();
-  }
-  if (!queued.length) {
-    showSendHint();
-    return;
-  }
-  hideSendHint();
-
-  if (endAfter) endAfterSubmit = true;
-  requestSnapshot("submit");
-}
-
-async function submitQueued() {
-  if (submitQueuedPromise) {
-    submitQueuedAgain = true;
-    return submitQueuedPromise;
-  }
-
-  let succeeded = false;
-  submitQueuedPromise = submitQueuedOnce();
-  try {
-    const result = await submitQueuedPromise;
-    succeeded = true;
-    return result;
-  } finally {
-    submitQueuedPromise = null;
-    const shouldSubmitAgain = submitQueuedAgain;
-    submitQueuedAgain = false;
-    if (!succeeded) {
-      endAfterSubmit = false;
-    } else if (!ended && shouldSubmitAgain) {
-      if (queued.length) {
-        submitQueued();
-      } else if (endAfterSubmit) {
-        endAfterSubmit = false;
-        endSession();
-      }
-    }
-  }
-}
-
-async function submitQueuedOnce() {
-  const prompts = queued.slice();
-  const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
-  if (shouldEndSession) body.endSession = true;
-  const response = await fetch("/api/" + key + "/prompts", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) throw new Error("failed to submit queued prompts");
-  for (const prompt of prompts) {
-    const index = queued.indexOf(prompt);
-    if (index !== -1) queued.splice(index, 1);
-  }
-  persistQueuedPrompts();
-  render();
-  if (shouldEndSession) {
-    endAfterSubmit = false;
-    markSessionEnded();
-    return;
-  }
-  if (agentPresence === "listening") setAgentPresence("working");
-}
+// ---------------------------------------------------------------------------
+// Layout gate. The artifact audits its own rendered layout in the iframe; the
+// gate holds the curtain until that audit comes back clean, so a broken surface
+// is never shown as if it were finished. An audit that never arrives is
+// uncertainty rather than a defect, so the timeout reveals without a banner.
+// ---------------------------------------------------------------------------
 
 function normalizeLayoutWarningsPayload(value) {
   return Array.isArray(value)
@@ -390,10 +115,7 @@ function isErrorLayoutWarning(warning) {
   return String(warning?.severity || "").toLowerCase() === "error";
 }
 
-function setLayoutIssueBanner(
-  visible,
-  text = "This surface has a severe layout failure. Your agent has been notified.",
-) {
+function setLayoutIssueBanner(visible, text = "This surface has a severe layout failure.") {
   if (!layoutIssueBanner) return;
   layoutIssueBanner.textContent = text;
   layoutIssueBanner.hidden = !visible;
@@ -408,9 +130,9 @@ function setLayoutGateCard(state) {
   if (!layoutGateTitle || !layoutGateCopy) return;
 
   if (state === "held") {
-    layoutGateTitle.innerHTML = "Fixing a layout issue...";
+    layoutGateTitle.innerHTML = "Layout issue found.";
     layoutGateCopy.textContent =
-      "The browser found inaccessible or unusable content. Your agent has been notified and this will reveal after the next clean reload.";
+      "The browser found inaccessible or unusable content. This will reveal after the next clean reload.";
     return;
   }
 
@@ -432,7 +154,7 @@ function revealLayoutGate({ showBanner = false, bannerText = undefined } = {}) {
 }
 
 function forceRevealLayoutGate(reason) {
-  if (!layoutGateEnabled || ended) return;
+  if (!layoutGateEnabled) return;
   if (reason === "timeout") {
     // A delayed or unavailable audit is uncertainty, not evidence of a defect.
     revealLayoutGate();
@@ -446,7 +168,7 @@ function forceRevealLayoutGate(reason) {
 }
 
 function startLayoutGateCycle() {
-  if (!layoutGateEnabled || layoutGateManuallyBypassed || ended) return;
+  if (!layoutGateEnabled || layoutGateManuallyBypassed) return;
 
   layoutGateCycle += 1;
   layoutGateArmed = true;
@@ -457,7 +179,7 @@ function startLayoutGateCycle() {
 
   const cycle = layoutGateCycle;
   layoutGateTimer = setTimeout(() => {
-    if (cycle !== layoutGateCycle || !layoutGateVisible || ended) return;
+    if (cycle !== layoutGateCycle || !layoutGateVisible) return;
     forceRevealLayoutGate("timeout");
   }, layoutGateMaxHoldMs);
   layoutGateTimer?.unref?.();
@@ -497,6 +219,8 @@ function initializeLayoutGate() {
   startLayoutGateCycle();
 }
 
+// Forwarded to the server so the `lavish-axi <file>` that opened this page can report the
+// browser's verdict back to the agent in the same turn. Nothing subscribes afterward.
 async function submitLayoutWarnings(layoutWarnings) {
   const response = await fetch("/api/" + key + "/layout-warnings", {
     method: "POST",
@@ -504,29 +228,6 @@ async function submitLayoutWarnings(layoutWarnings) {
     body: JSON.stringify({ layout_warnings: normalizeLayoutWarningsPayload(layoutWarnings) }),
   });
   if (!response.ok) throw new Error("failed to submit layout warnings");
-}
-
-async function endSession() {
-  if (ended) return;
-  const response = await fetch("/api/" + key + "/end", { method: "POST" });
-  if (!response.ok) throw new Error("failed to end session");
-  markSessionEnded();
-}
-
-function markSessionEnded() {
-  if (ended) return;
-  ended = true;
-  closeMenus();
-  closeWhiteboard();
-  annotationSwitch.disabled = true;
-  moreButton.disabled = true;
-  chatInput.disabled = true;
-  updateSendState();
-  if (presenceBanner) presenceBanner.hidden = true;
-  layoutGateManuallyBypassed = true;
-  revealLayoutGate();
-  postToFrame({ type: "lavish:setAnnotationMode", enabled: false });
-  endedOverlay.hidden = false;
 }
 
 function copyFilePath() {
@@ -538,11 +239,6 @@ function copyFilePath() {
     copyHint.classList.remove("copied");
     copyHintText.textContent = "Copy";
   }, 1600);
-}
-
-function copyDomSnapshot() {
-  closeMenus();
-  requestSnapshot("copy");
 }
 
 function exportFileName() {
@@ -667,41 +363,21 @@ async function publishShare(event) {
   }
 }
 
-function replaceArtifactFrame() {
+function resetFrame() {
   startLayoutGateCycle();
   inlineWhiteboardChannels.clear();
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
   frame.src = artifactSrc || frame.src;
 }
 
-function resetFrame() {
-  if (artifactResetPromise) return artifactResetPromise;
-  const hasLiveInlineWhiteboard = [...inlineWhiteboardChannels].some(
-    ([index, channel]) => channel.initialized && index !== overlayIndex,
-  );
-  if (!hasLiveInlineWhiteboard) {
-    replaceArtifactFrame();
-    return Promise.resolve(true);
-  }
-  artifactResetPromise = flushInlineWhiteboards()
-    .then((flushed) => {
-      if (!flushed) return false;
-      replaceArtifactFrame();
-      return true;
-    })
-    .finally(() => {
-      artifactResetPromise = null;
-    });
-  return artifactResetPromise;
-}
-
 // ---------------------------------------------------------------------------
-// Whiteboards. The artifact SDK embeds one sandboxed whiteboard frame in place
-// of each rendered Mermaid diagram. The chrome owns every server round trip
-// and serves all frames concurrently. The overlay hosts the same frame page
-// fullscreen when an inline frame asks to maximize - the inline frame is
-// suspended while the overlay owns that diagram so two editors never autosave
-// one sidecar.
+// Diagrams. The artifact SDK embeds one sandboxed frame in place of each
+// rendered Mermaid diagram, and the chrome owns every server round trip on
+// their behalf (the frames have no server access of their own). The overlay
+// hosts the same frame page fullscreen when an inline frame asks to maximize;
+// the inline frame parks on about:blank meanwhile so one diagram is never
+// rendered by two live frames at once. Nothing here is editable, so there is
+// no save, flush, or teardown handshake - closing is immediate.
 // ---------------------------------------------------------------------------
 
 /** @type {Map<number, { diagramId: string, source: string, sourceHash: string }>} */
@@ -710,13 +386,7 @@ const whiteboards = new Map();
 let overlayIndex = null;
 let overlayFrameReady = false;
 let overlayChannelId = "";
-let overlayOpeningIndex = null;
-let nextWhiteboardFlushId = 0;
-let artifactResetPromise = null;
 let chromeRestartReloadPromise = null;
-const whiteboardTeardowns = new Map();
-const whiteboardFlushes = new Map();
-const whiteboardSaveChains = new Map();
 const inlineWhiteboardChannels = new Map();
 
 function whiteboardTheme() {
@@ -775,8 +445,6 @@ async function handleWhiteboardReady(index, mode, isCurrent) {
     const sources = await fetchMermaidSources();
     const source = sources.find((item) => item.index === index);
     if (!source) throw new Error("this diagram's Mermaid source was not found in the artifact file");
-    const savedResponse = await fetch("/api/" + key + "/whiteboard/" + index);
-    const saved = savedResponse.ok ? (await savedResponse.json()).whiteboard : null;
     const record = whiteboardRecord(index);
     record.source = String(source.source || "");
     record.sourceHash = String(source.hash || "");
@@ -788,20 +456,19 @@ async function handleWhiteboardReady(index, mode, isCurrent) {
       diagramId: record.diagramId,
       source: record.source,
       sourceHash: record.sourceHash,
-      saved,
       theme: whiteboardTheme(),
     });
     return true;
   } catch (error) {
     if (mode === "overlay") {
-      showWhiteboardError("Could not open the whiteboard: " + (error instanceof Error ? error.message : String(error)));
+      showWhiteboardError("Could not open the diagram: " + (error instanceof Error ? error.message : String(error)));
     }
     return false;
   }
 }
 
-function showWhiteboardOverlay(index) {
-  if (ended) return;
+function openWhiteboardOverlay(index) {
+  if (overlayIndex !== null) return;
   overlayIndex = index;
   overlayFrameReady = false;
   overlayChannelId = "";
@@ -810,11 +477,13 @@ function showWhiteboardOverlay(index) {
   whiteboardOverlay.hidden = false;
   postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: index });
   // A fresh document per open: the frame boots, posts ready, and receives its
-  // init - no stale editor state can leak between opens.
+  // init - no stale state can leak between opens.
   whiteboardFrame.src = "/whiteboard-frame?diagramIndex=" + encodeURIComponent(String(index));
 }
 
-function finishWhiteboardClose(index) {
+function closeWhiteboard() {
+  const index = overlayIndex;
+  if (index === null) return;
   whiteboardOverlay.hidden = true;
   whiteboardError.hidden = true;
   whiteboardFrame.src = "about:blank";
@@ -822,238 +491,13 @@ function finishWhiteboardClose(index) {
   overlayFrameReady = false;
   overlayChannelId = "";
   inlineWhiteboardChannels.delete(index);
-  if (!ended) postToFrame({ type: "lavish:resumeWhiteboard", diagramIndex: index });
+  postToFrame({ type: "lavish:resumeWhiteboard", diagramIndex: index });
 }
 
-function whiteboardTeardownKey(index, placement) {
-  return placement + ":" + index;
-}
-
-function beginWhiteboardTeardown(index, placement, onComplete) {
-  const key = whiteboardTeardownKey(index, placement);
-  const pending = whiteboardTeardowns.get(key);
-  if (pending) {
-    if (onComplete) pending.promise.then(onComplete);
-    return pending.promise;
-  }
-  const flushId = `whiteboard-${++nextWhiteboardFlushId}`;
-  let resolve;
-  const promise = new Promise((complete) => {
-    resolve = complete;
-  });
-  const teardown = { index, placement, flushId, promise, resolve, onComplete };
-  whiteboardTeardowns.set(key, teardown);
-  const message = { type: "lavish-whiteboard:prepareTeardown", flushId };
-  postToWhiteboard(index, placement, message);
-  return promise;
-}
-
-function finishWhiteboardTeardown(index, message, placement) {
-  const flushId = String(message.flushId || "");
-  const key = whiteboardTeardownKey(index, placement);
-  const teardown = whiteboardTeardowns.get(key);
-  if (!teardown || teardown.index !== index || teardown.placement !== placement || teardown.flushId !== flushId) return;
-  whiteboardTeardowns.delete(key);
-  teardown.onComplete?.(true);
-  teardown.resolve(true);
-}
-
-function failWhiteboardTeardown(index, message, placement) {
-  const flushId = String(message.flushId || "");
-  const key = whiteboardTeardownKey(index, placement);
-  const teardown = whiteboardTeardowns.get(key);
-  if (!teardown || teardown.index !== index || teardown.placement !== placement || teardown.flushId !== flushId) return;
-  whiteboardTeardowns.delete(key);
-  teardown.onComplete?.(false);
-  teardown.resolve(false);
-}
-
-function whiteboardFlushKey(index, placement) {
-  return placement + ":" + index;
-}
-
-function beginWhiteboardFlush(index, placement) {
-  const flushKey = whiteboardFlushKey(index, placement);
-  const pending = whiteboardFlushes.get(flushKey);
-  if (pending) return pending.promise;
-  const flushId = `whiteboard-flush-${++nextWhiteboardFlushId}`;
-  let resolve;
-  const promise = new Promise((complete) => {
-    resolve = complete;
-  });
-  whiteboardFlushes.set(flushKey, { index, placement, flushId, promise, resolve });
-  postToWhiteboard(index, placement, { type: "lavish-whiteboard:flush", flushId });
-  return promise;
-}
-
-function finishWhiteboardFlush(index, message, placement) {
-  const flushId = String(message.flushId || "");
-  const flushKey = whiteboardFlushKey(index, placement);
-  const flush = whiteboardFlushes.get(flushKey);
-  if (!flush || flush.index !== index || flush.placement !== placement || flush.flushId !== flushId) return;
-  whiteboardFlushes.delete(flushKey);
-  flush.resolve(Boolean(message.ok));
-}
-
-async function flushWhiteboardsBeforeChromeReload() {
-  const flushes = [];
-  for (const [index, channel] of inlineWhiteboardChannels) {
-    if (channel.initialized && index !== overlayIndex) flushes.push(beginWhiteboardFlush(index, "inline"));
-  }
-  if (overlayIndex !== null && overlayFrameReady) flushes.push(beginWhiteboardFlush(overlayIndex, "overlay"));
-  if (flushes.length === 0) return;
-  let timeout;
-  await Promise.race([
-    Promise.all(flushes),
-    new Promise((resolve) => {
-      timeout = setTimeout(resolve, 1500);
-    }),
-  ]);
-  clearTimeout(timeout);
-}
-
-async function flushInlineWhiteboards() {
-  for (const [index, channel] of [...inlineWhiteboardChannels]) {
-    if (!channel.initialized || index === overlayIndex) continue;
-    if (!(await beginWhiteboardTeardown(index, "inline"))) return false;
-  }
-  return true;
-}
-
-function openWhiteboardOverlay(index) {
-  if (ended || overlayIndex !== null || overlayOpeningIndex !== null) return;
-  overlayOpeningIndex = index;
-  beginWhiteboardTeardown(index, "inline", (flushed) => {
-    if (overlayOpeningIndex !== index) return;
-    overlayOpeningIndex = null;
-    if (flushed && !ended && overlayIndex === null) showWhiteboardOverlay(index);
-  });
-}
-
-function closeWhiteboard() {
-  const index = overlayIndex;
-  if (index === null) return;
-  if (!overlayFrameReady) {
-    finishWhiteboardClose(index);
-    return;
-  }
-  beginWhiteboardTeardown(index, "overlay", (flushed) => {
-    if (flushed && overlayIndex === index) finishWhiteboardClose(index);
-  });
-}
-
-async function persistWhiteboardScene(index, message) {
-  const response = await fetch("/api/" + key + "/whiteboard/" + index, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      source_hash: String(message.sourceHash || ""),
-      text_metrics_version: Number(message.textMetricsVersion) || 0,
-      scene: message.scene || null,
-      baseline: message.baseline || null,
-    }),
-  });
-  if (!response.ok) throw new Error("failed to save whiteboard scene");
-}
-
-function saveWhiteboardScene(index, message) {
-  const previous = whiteboardSaveChains.get(index) || Promise.resolve();
-  const result = previous.catch(() => {}).then(() => persistWhiteboardScene(index, message));
-  const tail = result.catch(() => {});
-  whiteboardSaveChains.set(index, tail);
-  tail.finally(() => {
-    if (whiteboardSaveChains.get(index) === tail) whiteboardSaveChains.delete(index);
-  });
-  return result;
-}
-
-function handleWhiteboardSave(index, message, mode) {
-  const flushId = String(message.flushId || "");
-  saveWhiteboardScene(index, message).then(
-    () => {
-      if (flushId) postToWhiteboard(index, mode, { type: "lavish-whiteboard:saveResult", flushId, ok: true });
-    },
-    (error) => {
-      if (flushId) {
-        postToWhiteboard(index, mode, {
-          type: "lavish-whiteboard:saveResult",
-          flushId,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    },
-  );
-}
-
-function whiteboardSummaryText(summaryLines) {
-  return (Array.isArray(summaryLines) ? summaryLines : [])
-    .filter((line) => typeof line === "string")
-    .slice(0, 50)
-    .map((line) => line.slice(0, 300))
-    .join("\n");
-}
-
-async function queueWhiteboardFeedback(index, message, mode) {
-  const diagramId = whiteboardRecord(index).diagramId;
-  try {
-    // Persist the exact reviewed state before queueing, so the paths in the
-    // prompt point at what the user actually saw.
-    await saveWhiteboardScene(index, message);
-    const response = await fetch("/api/" + key + "/whiteboard/" + index + "/feedback-files", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scene: message.scene || null, pngDataUrl: String(message.pngDataUrl || "") }),
-    });
-    if (!response.ok) throw new Error("failed to write whiteboard feedback files");
-    const files = await response.json();
-    const note = String(message.note || "").slice(0, 4000);
-    const summary = whiteboardSummaryText(message.summaryLines);
-    const promptText =
-      (note ? note + "\n\n" : "") +
-      "Whiteboard edits to diagram " +
-      (index + 1) +
-      (diagramId ? " (" + diagramId + ")" : "") +
-      ":\n" +
-      (summary || "(no summary)") +
-      "\n\nEdited scene JSON: " +
-      String(files.scene_path || "") +
-      (files.preview_path ? "\nPNG preview: " + String(files.preview_path) : "");
-    enqueuePrompt({
-      uid: "",
-      prompt: promptText,
-      selector: "",
-      tag: "whiteboard",
-      text: "Whiteboard: diagram " + (index + 1),
-      target: {
-        type: "excalidraw-scene",
-        diagramIndex: index,
-        diagramId,
-        sourceHash: String(message.sourceHash || ""),
-        scenePath: String(files.scene_path || ""),
-        previewPath: String(files.preview_path || ""),
-        imageFallback: Boolean(message.imageFallback),
-        stats: message.stats && typeof message.stats === "object" ? message.stats : {},
-      },
-      // Re-queueing the same diagram's whiteboard before sending replaces the
-      // earlier unsent prompt instead of stacking duplicates.
-      [internalQueueKeyField]: "whiteboard:" + index,
-    });
-    postToWhiteboard(index, mode, { type: "lavish-whiteboard:queueResult", ok: true });
-    if (mode === "overlay") closeWhiteboard();
-  } catch (error) {
-    postToWhiteboard(index, mode, {
-      type: "lavish-whiteboard:queueResult",
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-// Inline frames live inside the artifact iframe, so a live reload replaces
-// them wholesale and they re-init against fresh sources on their own. Only an
-// open overlay outlives the reload; tell it when its diagram's source changed
-// underneath it so the frame can surface staleness (never silently merge).
+// Inline frames live inside the artifact iframe, so a live reload replaces them
+// wholesale and they re-convert from fresh sources on their own. Only an open
+// overlay outlives the reload; tell it when its diagram's source changed so it
+// can re-convert in place.
 async function refreshWhiteboardSource() {
   if (overlayIndex === null) return;
   const index = overlayIndex;
@@ -1072,7 +516,7 @@ async function refreshWhiteboardSource() {
       });
     }
   } catch {
-    // Best effort - the staleness banner also re-arms on the next open.
+    // Best effort - reopening the diagram converts the latest source anyway.
   }
 }
 
@@ -1082,17 +526,11 @@ function validWhiteboardIndex(value) {
 }
 
 function handleAuthenticatedWhiteboardMessage(index, message, mode) {
-  if (message.type === "lavish-whiteboard:save") handleWhiteboardSave(index, message, mode);
-  if (message.type === "lavish-whiteboard:queueFeedback") queueWhiteboardFeedback(index, message, mode);
   if (message.type === "lavish-whiteboard:maximize" && mode === "inline") openWhiteboardOverlay(index);
   if (message.type === "lavish-whiteboard:close" && mode === "overlay") closeWhiteboard();
-  if (message.type === "lavish-whiteboard:teardownReady") finishWhiteboardTeardown(index, message, mode);
-  if (message.type === "lavish-whiteboard:teardownFailed") failWhiteboardTeardown(index, message, mode);
-  if (message.type === "lavish-whiteboard:flushComplete") finishWhiteboardFlush(index, message, mode);
 }
 
 function handleInlineWhiteboardMessage(event, message) {
-  if (ended) return;
   const index = validWhiteboardIndex(message.diagramIndex);
   if (index === null || !event.source) return;
   if (message.type === "lavish-whiteboard:ready") {
@@ -1100,7 +538,7 @@ function handleInlineWhiteboardMessage(event, message) {
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
     authenticateWhiteboardChannel(channelId).then((authenticated) => {
-      if (!authenticated || ended || inlineWhiteboardChannels.has(index)) return;
+      if (!authenticated || inlineWhiteboardChannels.has(index)) return;
       const channel = { window: event.source, channelId, initialized: false };
       inlineWhiteboardChannels.set(index, channel);
       whiteboardRecord(index).diagramId = String(message.diagramId || "");
@@ -1158,9 +596,8 @@ function loadFrame() {
 
 function reloadArtifact() {
   closeMenus();
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
-  });
+  resetFrame();
+  refreshWhiteboardSource();
 }
 
 async function reloadAfterServerRestart() {
@@ -1177,7 +614,6 @@ async function reloadChromeAfterServerRestart() {
     try {
       const res = await fetch("/health", { cache: "no-store" });
       if (sawOutage && res.ok) {
-        await flushWhiteboardsBeforeChromeReload();
         location.reload();
         return;
       }
@@ -1188,7 +624,6 @@ async function reloadChromeAfterServerRestart() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  await flushWhiteboardsBeforeChromeReload();
   location.reload();
 }
 
@@ -1196,18 +631,6 @@ window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
 
   const msg = event.data || {};
-  if (msg.type === "lavish:queuePrompt") {
-    enqueuePrompt(msg.prompt);
-  }
-  if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
-    if (snapshotAction === "copy") {
-      copyText(msg.snapshot || "");
-    } else {
-      pendingSnapshot = msg.snapshot || "";
-      submitQueued();
-    }
-  }
   if (msg.type === "lavish:scroll") {
     lastScroll = { x: Number(msg.x) || 0, y: Number(msg.y) || 0 };
   }
@@ -1215,35 +638,13 @@ window.addEventListener("message", (event) => {
     handleLayoutWarningsForGate(msg.layout_warnings);
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
-  if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
-  if (msg.type === "lavish:endSession") endSession();
-  if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 });
 
 loadFrame();
 
-function toggleAnnotationMode() {
-  if (ended) return;
-  annotation = !annotation;
-  annotationSwitch.setAttribute("aria-pressed", String(annotation));
-  postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation });
-}
-
-annotationSwitch.onclick = toggleAnnotationMode;
-
-sendButton.onclick = () => sendQueued(false);
-sendAndEndButton.onclick = () => sendQueued(true);
 moreButton.onclick = () => toggleMenu(moreButton, moreMenu);
-chatInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-    event.preventDefault();
-    sendQueued(false);
-  }
-});
-chatInput.addEventListener("input", hideSendHint);
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
-copySnapshotButton.onclick = copyDomSnapshot;
 exportArtifactButton.onclick = exportArtifact;
 shareArtifactButton.onclick = openShareDialog;
 shareCloseButton.onclick = closeShareDialog;
@@ -1254,10 +655,6 @@ shareDialog.addEventListener("click", (event) => {
 });
 copyShareUrlButton.onclick = () => copyToButton(shareUrlInput.value, copyShareUrlButton, "Copy URL");
 copyUpdateKeyButton.onclick = () => copyToButton(shareUpdateKeyInput.value, copyUpdateKeyButton, "Copy key");
-endButton.onclick = () => {
-  closeMenus();
-  endSession();
-};
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
@@ -1274,19 +671,7 @@ document.addEventListener("keydown", (event) => {
     }
   }
 });
-// Capture phase so the mode hotkey fires no matter where focus is in the chrome - including
-// mid-keystroke in chatInput or an annotation-card textarea - without disturbing normal typing.
-document.addEventListener(
-  "keydown",
-  (event) => {
-    if (!isModeToggleHotkeyEvent(event)) return;
-    event.preventDefault();
-    toggleAnnotationMode();
-  },
-  true,
-);
 frame.addEventListener("load", () => {
-  postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (overlayIndex !== null) {
@@ -1299,15 +684,7 @@ initializeLayoutGate();
 
 const events = new EventSource("/events/" + key);
 events.addEventListener("reload", () => {
-  resetFrame().then((reloaded) => {
-    if (reloaded) refreshWhiteboardSource();
-  });
+  resetFrame();
+  refreshWhiteboardSource();
 });
 events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
-events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
-events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
-
-render();
-initialChat.forEach((item) => addChat(item.role, item.text));
-setAgentPresence("waiting");

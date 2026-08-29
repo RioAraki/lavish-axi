@@ -13,23 +13,12 @@ import {
   classifySevereTextOverflow,
   classifyMaterialRectEscape,
   createArtifactSdk,
-  deriveLavishQueueKey,
   findStableLayoutFindings,
   isMaterialPageOverflow,
-  isModeToggleHotkeyEvent,
-  isNativeInteractiveControl,
   isNearTotalOcclusion,
-  MODE_TOGGLE_HOTKEY_KEY,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
 import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
-import {
-  isValidDiagramIndex,
-  isValidWhiteboardKey,
-  loadWhiteboard,
-  saveWhiteboard,
-  writeWhiteboardFeedbackFiles,
-} from "./whiteboard-store.js";
 import {
   buildSelfContainedHtml,
   exportFileName,
@@ -63,6 +52,14 @@ const designAssetUrls = {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
+// How long `lavish-axi <file>` may wait for the browser's render-time layout audit before
+// returning anyway. Matched to the chrome's own layout-gate max hold so the CLI and the browser
+// give up on a missing verdict at the same moment; a heavy page (webfonts, a CDN Tailwind
+// compile, several diagrams) routinely needs several seconds to settle before the audit runs.
+// Clean pages answer as soon as the audit lands, so the full budget only elapses when the
+// browser never reports - and a missing audit is uncertainty, not a defect, so the open still
+// succeeds and reports no findings.
+export const DEFAULT_LAYOUT_AUDIT_WAIT_MS = 12_000;
 
 // The whiteboard frame bundle (Excalidraw + Mermaid converter + React) is
 // produced by `scripts/build.js` into dist/whiteboard. Packaged runs find it
@@ -72,13 +69,6 @@ export function defaultWhiteboardAssetsDir() {
   const packaged = fileURLToPath(new URL("./whiteboard", import.meta.url));
   if (existsSync(packaged)) return packaged;
   return fileURLToPath(new URL("../dist/whiteboard", import.meta.url));
-}
-
-// Whiteboard scene saves carry full Excalidraw scenes (and, at queue time, a
-// PNG preview data URL), which outgrow the default 2 MB JSON cap. Only the
-// whiteboard write routes get the larger limit.
-export function isWhiteboardWriteApiPath(pathname) {
-  return /^\/api\/[0-9a-f]{16}\/whiteboard\/\d{1,3}(\/feedback-files)?$/.test(String(pathname || ""));
 }
 
 export function createWhiteboardChannelToken(secret, now = Date.now()) {
@@ -99,10 +89,9 @@ export function isValidWhiteboardChannelToken(token, secret, now = Date.now()) {
   return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
-// A detached server should not live forever. When no browser chrome (SSE) and no agent poll
-// are connected for this long, the server shuts itself down so it stops dangling. The next
-// `lavish-axi <file>` invocation re-spawns a fresh server and adopts resumable sessions from
-// state.json. Browser-ended sessions still require the explicit --reopen opt-in. Set
+// A detached server should not live forever. When no browser chrome (SSE) is connected for
+// this long, the server shuts itself down so it stops dangling. The next `lavish-axi <file>`
+// invocation re-spawns a fresh server and adopts sessions from state.json. Set
 // LAVISH_AXI_IDLE_TIMEOUT_MS to 0/off to disable, or to a custom millisecond budget.
 export function resolveIdleTimeoutMs(env = process.env) {
   const raw = env.LAVISH_AXI_IDLE_TIMEOUT_MS?.trim();
@@ -119,7 +108,6 @@ export async function serve({
   version = "",
   debug = false,
   log = null,
-  pollHeartbeatMs = 15_000,
   idleTimeoutMs = resolveIdleTimeoutMs(),
   host = bindHost(),
   linkHost: linkHostName = linkHost(),
@@ -130,8 +118,11 @@ export async function serve({
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
-  const activePolls = new Map();
-  const deliveredFeedback = new Set();
+  // Latest render-time layout audit per session, in memory only. It exists to answer the one
+  // bounded `GET /api/:key/layout-audit` the CLI makes right after opening a browser; nothing
+  // subscribes to it afterward, so it never belongs in state.json.
+  /** @type {Map<string, { layout_warnings: any[] }>} */
+  const layoutAudits = new Map();
   const sseClients = new Set();
   const whiteboardChannelSecret = crypto.randomBytes(32);
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
@@ -139,11 +130,8 @@ export async function serve({
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
-  // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
-  const whiteboardStateRoot = path.dirname(stateFile);
-
   // DNS-rebinding guard. isSameOriginRequest (used on /share and the whiteboard
-  // write routes) stops classic cross-origin CSRF but NOT DNS rebinding: a page
+  // channel route) stops classic cross-origin CSRF but NOT DNS rebinding: a page
   // that rebinds its own domain to this loopback port sends that domain in both
   // Origin and Host, so the two still match. The robust defense is a Host-header
   // allowlist - a rebound browser carries the attacker's domain in Host, which is
@@ -172,11 +160,7 @@ export async function serve({
     });
   }
 
-  const defaultJsonParser = express.json({ limit: "2mb" });
-  const whiteboardJsonParser = express.json({ limit: "20mb" });
-  app.use((req, res, next) =>
-    isWhiteboardWriteApiPath(req.path) ? whiteboardJsonParser(req, res, next) : defaultJsonParser(req, res, next),
-  );
+  app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", (req, res) => {
     res.json({ ok: true, app: "lavish-axi", version });
@@ -197,18 +181,6 @@ export async function serve({
     try {
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
-      const reopen = Boolean(req.body.reopen);
-      const existing = await store.findByKey(key);
-      // A user-initiated end (ending or send-and-ending from the browser) means the human
-      // deliberately closed the review surface. Silently reopening it on the next
-      // `lavish-axi <file>` is the exact behavior this route exists to prevent - require an
-      // explicit `reopen` opt-in instead of reviving it automatically. Agent-initiated ends
-      // (`lavish-axi end`) keep reviving on the next open, same as before this change.
-      if (existing?.status === "ended" && existing.ended_by === "user" && !reopen) {
-        logEvent?.(`session open blocked (user-ended) key=${key} file=${file}`);
-        res.json({ key, file, slug: existing.slug, url: existing.url, status: "user-ended" });
-        return;
-      }
       // The slug is minted (or recovered) by the store, so the URL is built from it rather than
       // the other way around.
       const session = await store.upsertSession(
@@ -216,9 +188,9 @@ export async function serve({
         (slug) => `http://${hostForUrl(linkHostName)}:${publicPort}/session/${slug}`,
       );
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(session.url) : session.url;
-      if (existing?.status === "ended") {
-        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      }
+      // A re-open gets a fresh audit from the reloaded page, so the previous verdict must not
+      // satisfy the wait that follows this response.
+      layoutAudits.delete(key);
       logEvent?.(`session opened key=${key} slug=${session.slug} file=${file}`);
       await watchSession(session, watchers, events, logEvent);
       res.json({ key, file, slug: session.slug, url, status: "opened" });
@@ -227,140 +199,70 @@ export async function serve({
     }
   });
 
-  app.get("/api/poll", async (req, res, next) => {
-    try {
-      const file = await canonicalFile(String(req.query.file || ""));
-      const key = sessionKey(file);
-      const timeoutMs =
-        req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
-      const immediate = await store.takeFeedback(key);
-      if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-        res.json(immediate);
-        return;
-      }
-      const streamHeartbeat = timeoutMs === null;
-      let heartbeat = null;
-      if (streamHeartbeat) {
-        res.status(200).type("application/json");
-        res.write(" ");
-        heartbeat = setInterval(() => {
-          if (!res.writableEnded) res.write(" ");
-        }, pollHeartbeatMs);
-        heartbeat.unref?.();
-      }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
-      refreshIdleTimer();
-      const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
-      let cleaned = false;
-      let responding = false;
-      const cleanup = () => {
-        if (cleaned) return;
-        cleaned = true;
-        if (timer) clearTimeout(timer);
-        if (heartbeat) clearInterval(heartbeat);
-        events.off("feedback", onFeedback);
-        events.off("ended", onFeedback);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
-        refreshIdleTimer();
-      };
-      const respond = async () => {
-        if (responding || res.writableEnded) return;
-        responding = true;
-        try {
-          const result = await store.takeFeedback(key);
-          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
-          if (streamHeartbeat) {
-            res.end(JSON.stringify(result));
-          } else {
-            res.json(result);
-          }
-        } finally {
-          cleanup();
-        }
-      };
-      function handleRespondError(error) {
-        if (streamHeartbeat) {
-          cleanup();
-          if (!res.writableEnded) res.destroy(error);
-          return;
-        }
-        next(error);
-      }
-      const onFeedback = (changedKey) => {
-        if (changedKey !== key || res.writableEnded) {
-          return;
-        }
-        respond().catch(handleRespondError);
-      };
-      events.on("feedback", onFeedback);
-      events.on("ended", onFeedback);
-      req.on("close", cleanup);
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/prompts", async (req, res, next) => {
-    try {
-      const shouldEndSession = Boolean(req.body?.endSession || req.body?.end_session);
-      const session = await store.queuePrompts(req.params.key, req.body || {});
-      if (!session) {
-        res.status(404).json({ error: "session not found" });
-        return;
-      }
-      if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit(shouldEndSession ? "ended" : "feedback", req.params.key);
-      res.json({ status: "queued", pending_prompts: session.pending_prompts });
-      if (shouldEndSession) await shutdownIfNoLiveSessions();
-    } catch (error) {
-      next(error);
-    }
-  });
-
+  // The chrome forwards the artifact's render-time layout audit here. Findings are kept in
+  // memory for exactly one bounded read by the CLI's open command and are never persisted.
   app.post("/api/:key/layout-warnings", async (req, res, next) => {
     try {
-      const result = await store.recordLayoutWarnings(req.params.key, req.body || {});
-      if (!result) {
-        res.status(404).json({ error: "session not found" });
-        return;
-      }
-      if (result.changed && result.hasWarnings) {
-        events.emit("feedback", req.params.key);
-      }
-      res.json({ status: "recorded", layout_warnings: result.session.layout_warnings?.length || 0 });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/end", async (req, res, next) => {
-    try {
-      await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key);
-      res.json({ status: "ended" });
-      await shutdownIfNoLiveSessions();
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/:key/agent-reply", async (req, res, next) => {
-    try {
-      const text = String(req.body?.text || "");
-      const session = await store.addAgentReply(req.params.key, text);
+      const session = await store.findByKey(req.params.key);
       if (!session) {
         res.status(404).json({ error: "session not found" });
         return;
       }
-      events.emit("agent-reply", req.params.key, text);
-      // The reply concludes the delivered-feedback "working" state. Without this, a poll that
-      // drains feedback and then releases leaves presence stuck on "working" — the chrome keeps
-      // Send disabled — until some future poll happens to attach, even though the agent already
-      // answered. See "SSE agent-presence returns to waiting after an agent reply".
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      res.json({ status: "sent" });
+      const layoutWarnings = normalizeLayoutWarnings(req.body?.layout_warnings || req.body?.layoutWarnings || []);
+      layoutAudits.set(req.params.key, { layout_warnings: layoutWarnings });
+      events.emit("layout-audit", req.params.key);
+      res.json({ status: "recorded", layout_warnings: layoutWarnings.length });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Bounded wait for the browser's verdict on the artifact just opened. This is the only
+  // request the agent makes after opening a session, and it always answers: `reported` with
+  // the findings, or `timeout` when the browser did not get far enough in time. A timeout is
+  // never treated as a defect - an absent audit is uncertainty, so it fails open.
+  app.get("/api/:key/layout-audit", async (req, res, next) => {
+    try {
+      const key = req.params.key;
+      const session = await store.findByKey(key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const requested = Number(req.query.timeoutMs);
+      const timeoutMs = Number.isFinite(requested)
+        ? Math.max(0, Math.min(requested, 60_000))
+        : DEFAULT_LAYOUT_AUDIT_WAIT_MS;
+      const respond = (audit) => {
+        if (res.writableEnded) return;
+        res.json(
+          audit
+            ? { status: "reported", layout_warnings: audit.layout_warnings }
+            : { status: "timeout", layout_warnings: [] },
+        );
+      };
+      const existing = layoutAudits.get(key);
+      if (existing) {
+        respond(existing);
+        return;
+      }
+      let timer = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        events.off("layout-audit", onAudit);
+      };
+      function onAudit(auditedKey) {
+        if (auditedKey !== key) return;
+        cleanup();
+        respond(layoutAudits.get(key));
+      }
+      timer = setTimeout(() => {
+        cleanup();
+        respond(null);
+      }, timeoutMs);
+      timer.unref?.();
+      events.on("layout-audit", onAudit);
+      req.on("close", cleanup);
     } catch (error) {
       next(error);
     }
@@ -438,20 +340,6 @@ export async function serve({
     }
   });
 
-  app.post("/api/end", async (req, res, next) => {
-    try {
-      const file = await canonicalFile(req.body.file);
-      const key = sessionKey(file);
-      await store.endSession(key, "agent");
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key);
-      res.json({ status: "ended" });
-      await shutdownIfNoLiveSessions();
-    } catch (error) {
-      next(error);
-    }
-  });
-
   // Machine-wide index of every session in state.json. Sessions are otherwise only reachable by
   // a URL the agent printed once, so a closed tab used to mean a lost review surface.
   app.get("/session", async (req, res, next) => {
@@ -464,8 +352,6 @@ export async function serve({
             key: session.key,
             url: session.url,
             file: session.file,
-            status: session.status,
-            pending_prompts: session.pending_prompts || 0,
             title: meta.title,
             description: meta.description,
             opened_at: session.opened_at || "",
@@ -489,8 +375,7 @@ export async function serve({
       if (!error || error.code !== "ENOENT") throw error;
     });
     await store.deleteSession(session.key);
-    clearFeedbackDelivery(session.key, activePolls, deliveredFeedback, events);
-    events.emit("ended", session.key);
+    layoutAudits.delete(session.key);
     // The file is gone, so its watcher can only report the deletion to nobody.
     const watcher = watchers.get(session.key);
     if (watcher) {
@@ -604,36 +489,21 @@ export async function serve({
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
+      // Flush the headers immediately with a comment frame. Without a first write the response
+      // can sit buffered, so a client that awaits the response before subscribing would hang
+      // until the first real event - which, for a page that never reloads, is never.
+      res.write(": connected\n\n");
       sseClients.add(res);
       refreshIdleTimer();
-      const session = await store.findByKey(req.params.key);
       const sendReload = (key) => {
         if (key === req.params.key) {
           res.write("event: reload\ndata: {}\n\n");
         }
       };
-      const sendAgentReply = (key, text) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
-        }
-      };
-      const sendPresence = (key, state) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
-        }
-      };
-      res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
-      res.write(
-        `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
-      );
       events.on("reload", sendReload);
-      events.on("agent-reply", sendAgentReply);
-      events.on("agent-presence", sendPresence);
       req.on("close", () => {
         sseClients.delete(res);
         events.off("reload", sendReload);
-        events.off("agent-reply", sendAgentReply);
-        events.off("agent-presence", sendPresence);
         refreshIdleTimer();
       });
     } catch (error) {
@@ -738,20 +608,6 @@ export async function serve({
     }
   });
 
-  app.get("/api/:key/whiteboard/:index", async (req, res, next) => {
-    try {
-      const session = await store.findByKey(req.params.key);
-      if (!session || !isValidDiagramIndex(req.params.index)) {
-        res.status(404).json({ error: "whiteboard not found" });
-        return;
-      }
-      const whiteboard = await loadWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index));
-      res.json({ whiteboard });
-    } catch (error) {
-      next(error);
-    }
-  });
-
   app.post("/api/:key/whiteboard-channel", async (req, res, next) => {
     try {
       if (!isSameOriginRequest(req)) {
@@ -768,61 +624,6 @@ export async function serve({
         return;
       }
       res.json({ status: "authenticated" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  // Writing to the local state directory is a state-changing action, so both
-  // whiteboard write routes are same-origin guarded like /share - a hostile
-  // cross-origin page must not be able to fill the state dir through the
-  // loopback server.
-  app.put("/api/:key/whiteboard/:index", async (req, res, next) => {
-    try {
-      if (!isSameOriginRequest(req)) {
-        res.status(403).json({ error: "cross-origin whiteboard write rejected" });
-        return;
-      }
-      const session = await store.findByKey(req.params.key);
-      if (!session || !isValidWhiteboardKey(req.params.key) || !isValidDiagramIndex(req.params.index)) {
-        res.status(404).json({ error: "whiteboard not found" });
-        return;
-      }
-      const body = req.body || {};
-      await saveWhiteboard(whiteboardStateRoot, req.params.key, Number(req.params.index), {
-        sourceHash: String(body.source_hash || body.sourceHash || ""),
-        textMetricsVersion: Number(body.text_metrics_version || body.textMetricsVersion) || 0,
-        scene: body.scene ?? null,
-        baseline: body.baseline ?? null,
-      });
-      res.json({ status: "saved" });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  // Publish the agent-facing feedback files (.excalidraw scene + PNG preview)
-  // for a diagram, returning their absolute paths for the queued prompt's
-  // target. Files stay on this machine; the prompt carries only the paths.
-  app.post("/api/:key/whiteboard/:index/feedback-files", async (req, res, next) => {
-    try {
-      if (!isSameOriginRequest(req)) {
-        res.status(403).json({ error: "cross-origin whiteboard write rejected" });
-        return;
-      }
-      const session = await store.findByKey(req.params.key);
-      if (!session || !isValidWhiteboardKey(req.params.key) || !isValidDiagramIndex(req.params.index)) {
-        res.status(404).json({ error: "whiteboard not found" });
-        return;
-      }
-      const body = req.body || {};
-      const { scenePath, previewPath } = await writeWhiteboardFeedbackFiles(
-        whiteboardStateRoot,
-        req.params.key,
-        Number(req.params.index),
-        { scene: body.scene ?? null, pngDataUrl: String(body.pngDataUrl || body.png_data_url || "") },
-      );
-      res.json({ scene_path: scenePath, preview_path: previewPath });
     } catch (error) {
       next(error);
     }
@@ -883,10 +684,10 @@ export async function serve({
       idleTimer = null;
     }
     if (shuttingDown || idleTimeoutMs == null) return;
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    if (sseClients.size > 0) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!shuttingDown && sseClients.size === 0 && activePolls.size === 0) {
+      if (!shuttingDown && sseClients.size === 0) {
         logEvent?.(`idle for ${idleTimeoutMs}ms with no connections, shutting down`);
         shutdown();
       }
@@ -894,17 +695,15 @@ export async function serve({
     idleTimer.unref?.();
   }
 
-  // When the final open session ends with nothing connected, there is nothing left to serve,
-  // so step down immediately rather than waiting out the idle timeout. If a browser chrome or
-  // poll is still attached (e.g. the user is about to reopen), leave the server up and let the
-  // idle timer reap it once those connections drop. Best-effort: never let a read failure
-  // block the end response.
+  // When the last session is deleted with no browser attached there is nothing left to serve,
+  // so step down immediately rather than waiting out the idle timeout. If a chrome is still
+  // connected, leave the server up and let the idle timer reap it once that drops.
+  // Best-effort: never let a read failure block the delete response.
   async function shutdownIfNoLiveSessions() {
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    if (sseClients.size > 0) return;
     try {
-      const sessions = await store.listSessions();
-      if (sessions.every((session) => session.status === "ended")) {
-        logEvent?.("last open session ended with no live connections, shutting down");
+      if ((await store.listSessions()).length === 0) {
+        logEvent?.("last session removed with no live connections, shutting down");
         setImmediate(shutdown);
       }
     } catch {
@@ -1141,43 +940,34 @@ export function hasLiveReloadRootOptIn(html) {
   return /<meta\b(?=[^>]*name=["']lavish-live-reload["'])(?=[^>]*content=["']root["'])[^>]*>/i.test(searchableHtml);
 }
 
-function setPollActive(key, activePolls, deliveredFeedback, events, active) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  const count = activePolls.get(key) || 0;
-  const nextCount = active ? count + 1 : Math.max(0, count - 1);
-  if (nextCount === count) return;
-  if (nextCount === 0) {
-    activePolls.delete(key);
-  } else {
-    activePolls.set(key, nextCount);
-    deliveredFeedback.delete(key);
-  }
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
+// Validate and canonicalize the render-time layout audit coming back from the browser.
+// Only proven severe (error) findings survive; everything else fails open and stays silent.
+export function normalizeLayoutWarnings(layoutWarnings) {
+  if (!Array.isArray(layoutWarnings)) return [];
+  return layoutWarnings
+    .filter(
+      (warning) =>
+        warning &&
+        typeof warning === "object" &&
+        !Array.isArray(warning) &&
+        String(warning.severity || "").toLowerCase() === "error",
+    )
+    .map((warning) => {
+      const axis = warning.axis === "vertical" ? "vertical" : warning.axis === "horizontal" ? "horizontal" : undefined;
+      return {
+        selector: String(warning.selector || ""),
+        kind: String(warning.kind || "layout-failure"),
+        ...(axis ? { axis } : {}),
+        overflowPx: normalizeFiniteNumber(warning.overflowPx),
+        viewportWidth: normalizeFiniteNumber(warning.viewportWidth),
+        severity: "error",
+      };
+    });
 }
 
-function markFeedbackDelivered(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  deliveredFeedback.add(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
-  }
-}
-
-function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  deliveredFeedback.delete(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
-  }
-}
-
-export function computePresence(key, activePolls, deliveredFeedback) {
-  if (activePolls.has(key)) return "listening";
-  if (deliveredFeedback.has(key)) return "working";
-  return "waiting";
+function normalizeFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function chromeIcon(paths, size = 16, strokeWidth = 1.7) {
@@ -1385,17 +1175,10 @@ export function sortEntriesByRecency(entries) {
   });
 }
 
-function statusLabel(status) {
-  const value = String(status || "open");
-  return value === "feedback" || value === "ended" ? value : "open";
-}
-
 function indexCard(entry, { home, recent }) {
   const key = String(entry?.key || "");
   const title = entryTitle(entry);
   const { tail } = displayPathParts(String(entry?.file || ""), home);
-  const status = statusLabel(entry?.status);
-  const pending = Number(entry?.pending_prompts) || 0;
   const missing = Boolean(entry?.missing);
   const description = String(entry?.description || "");
   // Only the recent view carries data-updated-at; its presence is what tells the client script
@@ -1404,7 +1187,7 @@ function indexCard(entry, { home, recent }) {
   const updatedAttr = recent ? ` data-updated-at="${escapeHtml(String(entry?.updated_at || ""))}"` : "";
   return `<article class="card${missing ? " is-missing" : ""}" data-key="${escapeHtml(key)}" data-opened-at="${escapeHtml(String(entry?.opened_at || ""))}"${updatedAttr}>
 <a class="card-open" href="${escapeHtml(String(entry?.url || ""))}">
-<div class="card-top"><h3 class="card-title">${escapeHtml(title)}</h3><span class="badge badge-${status}">${status}</span>${missing ? '<span class="badge badge-missing">missing</span>' : ""}${pending > 0 ? `<span class="badge badge-pending">${pending} pending</span>` : ""}</div>
+<div class="card-top"><h3 class="card-title">${escapeHtml(title)}</h3>${missing ? '<span class="badge badge-missing">missing</span>' : ""}</div>
 ${description ? `<p class="card-desc">${escapeHtml(description)}</p>` : ""}
 <p class="card-file">${escapeHtml(tail)}</p>
 <p class="card-age"><span class="age-label">${recent ? "updated" : "opened"}</span> <span class="age-value">recently</span></p>
@@ -1461,10 +1244,7 @@ body.lavish-index { margin: 0; padding: 32px clamp(16px, 5vw, 56px) 64px; backgr
 .card-top { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .card-title { margin: 0; min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; font-size: 15px; font-weight: 600; }
 .badge { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: 11px; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
-.badge-open { color: #2f7d32; border-color: currentColor; }
-.badge-feedback { color: var(--accent); border-color: currentColor; }
 .badge-missing { color: var(--danger); border-color: currentColor; }
-.badge-pending { color: var(--accent); border-color: currentColor; }
 .card-desc { margin: 8px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
 .card-file { margin: 10px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .card-age { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
@@ -1677,20 +1457,16 @@ ${LAVISH_DEFAULT_FAVICON}
 
 export function createChromeHtml(
   session,
-  { layoutGateEnabled = true, faviconTag = LAVISH_DEFAULT_FAVICON, title = "Lavish Editor" } = {},
+  { layoutGateEnabled = true, faviconTag = LAVISH_DEFAULT_FAVICON, title = "Lavish" } = {},
 ) {
   const sessionJson = jsonScript({
     key: session.key,
     file: session.file,
-    initialChat: session.chat || [],
     layoutGateEnabled,
-    modeToggleHotkeyKey: MODE_TOGGLE_HOTKEY_KEY,
   });
   const { head: pathHead, tail: pathTail } = displayPathParts(session.file);
   const bodyClass = layoutGateEnabled ? "lavish layout-gate-active" : "lavish";
   const layoutGateHidden = layoutGateEnabled ? "" : " hidden";
-  const modeHotkeyUpper = MODE_TOGGLE_HOTKEY_KEY.toUpperCase();
-  const modeToggleHint = `Toggle annotate/explore mode (⌘${modeHotkeyUpper} / Ctrl+${modeHotkeyUpper})`;
   return `<!doctype html>
 <html>
 <head>
@@ -1701,11 +1477,10 @@ ${faviconTag}
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface has a severe layout failure. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span></div><div class="spacer" aria-hidden="true"></div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Artifact</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button></div></div></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface has a severe layout failure.</div></div></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
-<div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
-<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
+<div class="curtain layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="curtain-card"><div class="curtain-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="curtain-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button curtain-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="whiteboard-overlay" id="whiteboardOverlay" hidden><div class="whiteboard-shell"><div class="whiteboard-error" id="whiteboardError" hidden></div><button class="whiteboard-close" id="whiteboardClose" type="button" aria-label="Close whiteboard"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><iframe id="whiteboardFrame" title="Excalidraw whiteboard" sandbox="allow-scripts allow-popups"></iframe></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>
 <script src="/chrome-client.js"></script>
@@ -1719,7 +1494,7 @@ export function createWhiteboardFrameHtml(channelToken = "") {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lavish Whiteboard</title>
+<title>Lavish Diagram</title>
 <link rel="stylesheet" href="/whiteboard-assets/whiteboard.css">
 </head>
 <body>
@@ -1731,19 +1506,15 @@ export function createWhiteboardFrameHtml(channelToken = "") {
 
 export function createSdkJs(key) {
   // Serialize every helper exported by mermaid-node.js as a same-scope const so
-  // cross-helper calls (e.g. mermaidNodeFrom → mermaidNodeElement) resolve in the
-  // browser. Deriving this from the module's exports — rather than a hand-kept
-  // list — means adding a helper can never silently ReferenceError at runtime.
+  // cross-helper calls resolve in the browser. Deriving this from the module's
+  // exports — rather than a hand-kept list — means adding a helper can never
+  // silently ReferenceError at runtime.
   const mermaidHelperEntries = Object.entries(mermaidNode).filter(([, value]) => typeof value === "function");
   const mermaidHelperDecls = mermaidHelperEntries.map(([name, fn]) => `const ${name}=${fn.toString()};`).join("\n");
   const mermaidHelperKeys = mermaidHelperEntries.map(([name]) => name).join(", ");
   return `(() => {
 const key=${JSON.stringify(key)};
 void key;
-const deriveQueueKey=${deriveLavishQueueKey.toString()};
-const isNativeInteractiveControl=${isNativeInteractiveControl.toString()};
-const MODE_TOGGLE_HOTKEY_KEY=${JSON.stringify(MODE_TOGGLE_HOTKEY_KEY)};
-const isModeToggleHotkeyEvent=${isModeToggleHotkeyEvent.toString()};
 const classifySevereTextOverflow=${classifySevereTextOverflow.toString()};
 const classifyMaterialRectEscape=${classifyMaterialRectEscape.toString()};
 const isMaterialPageOverflow=${isMaterialPageOverflow.toString()};
@@ -1751,7 +1522,7 @@ const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
-(${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers);
+(${createArtifactSdk.toString()})(mermaidHelpers);
 })();`;
 }
 

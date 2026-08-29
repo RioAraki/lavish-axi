@@ -2,126 +2,6 @@
 
 import * as mermaidHelpers from "./mermaid-node.js";
 
-export const LAVISH_INTERNAL_QUEUE_KEY = "_lavishQueueKey";
-
-export const MODE_TOGGLE_HOTKEY_KEY = "i";
-
-export function isModeToggleHotkeyEvent(event) {
-  if (event.shiftKey || event.altKey) return false;
-  return Boolean(event.metaKey || event.ctrlKey) && String(event.key || "").toLowerCase() === MODE_TOGGLE_HOTKEY_KEY;
-}
-
-// Derive the browser-only replacement key used to collapse unsent updates for the same input.
-// The key is stripped by the chrome before prompts are sent to the server or returned by poll.
-export function deriveLavishQueueKey(element, options = {}) {
-  function stringValue(value) {
-    return value === null || value === undefined ? "" : String(value);
-  }
-
-  function attributeValue(el, name) {
-    if (!el) return "";
-    if (el.getAttribute) {
-      const value = el.getAttribute(name);
-      if (value !== null && value !== undefined) return value;
-    }
-    return el[name] || "";
-  }
-
-  function tagName(el) {
-    return stringValue(el?.tagName || el?.nodeName).toLowerCase();
-  }
-
-  function closestElementMatching(el, selector) {
-    return el && el.closest ? el.closest(selector) : null;
-  }
-
-  function elementPath(el) {
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === 1 && parts.length < 6) {
-      let part = tagName(node) || "element";
-      const id = stringValue(attributeValue(node, "id") || node.id).trim();
-      if (id) {
-        part += `#${id}`;
-        parts.unshift(part);
-        break;
-      }
-
-      const parent = node.parentElement;
-      if (parent && parent.children) {
-        const siblings = [...parent.children].filter((child) => tagName(child) === tagName(node));
-        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
-      }
-      parts.unshift(part);
-      node = parent;
-    }
-    return parts.join(" > ");
-  }
-
-  function scopeKey(el) {
-    const scope = closestElementMatching(el, "form,fieldset") || el?.parentElement || el;
-    const tag = tagName(scope) || "scope";
-    const explicit = stringValue(
-      attributeValue(scope, "data-lavish-question") || attributeValue(scope, "id") || attributeValue(scope, "name"),
-    ).trim();
-    if (explicit) return `${tag}:${explicit}`;
-    return elementPath(scope) || tag;
-  }
-
-  function controlIdentity(el) {
-    const identity = stringValue(attributeValue(el, "name") || attributeValue(el, "id") || el?.name).trim();
-    if (identity) return identity;
-    return elementPath(el);
-  }
-
-  function isKeyedInputType(type) {
-    return !new Set(["button", "submit", "reset", "file", "image", "hidden", "radio", "checkbox"]).has(type);
-  }
-
-  if (Object.hasOwn(options, "queueKey")) {
-    return stringValue(options.queueKey).trim();
-  }
-
-  const question = closestElementMatching(element, "[data-lavish-question]");
-  const questionKey = stringValue(attributeValue(question, "data-lavish-question")).trim();
-  if (questionKey) return `question:${questionKey}`;
-
-  const tag = tagName(element);
-  const type = stringValue(attributeValue(element, "type") || element?.type).toLowerCase();
-  const scope = scopeKey(element);
-
-  if (tag === "input" && type === "radio") {
-    const name = stringValue(attributeValue(element, "name") || element?.name).trim();
-    if (name) return `radio:${scope}:${name}`;
-    return "";
-  }
-
-  if (tag === "input" && type === "checkbox") {
-    const identity = controlIdentity(element);
-    const explicitValue = stringValue(element?.getAttribute ? element.getAttribute("value") : "").trim();
-    const option = explicitValue || stringValue(attributeValue(element, "id") || elementPath(element)).trim();
-    if (identity) return `checkbox:${scope}:${identity}:${option}`;
-    return "";
-  }
-
-  if (tag === "select" || tag === "textarea" || (tag === "input" && isKeyedInputType(type))) {
-    const identity = controlIdentity(element);
-    if (identity) return `field:${scope}:${identity}`;
-  }
-
-  return "";
-}
-
-export function isNativeInteractiveControl(el) {
-  return !!(
-    el &&
-    el.closest &&
-    el.closest(
-      "button,input,select,textarea,option,optgroup,label,summary,[contenteditable]:not([contenteditable='false'])",
-    )
-  );
-}
-
 // A severe text failure needs rendered-fragment proof. Scroll dimensions include harmless font
 // ink, masks, transforms, and offscreen carousel content, so they are never sufficient. A line is
 // severe only when a material portion of a real text fragment crosses its own clipping boundary,
@@ -246,32 +126,13 @@ export function isNearTotalOcclusion({ occludedSamples, totalSamples, minSamples
   return Number.isFinite(occluded) && Number.isFinite(total) && total >= minSamples && occluded / total >= minRatio;
 }
 
-export function createArtifactSdk(
-  deriveQueueKey,
-  isNativeInteractive = isNativeInteractiveControl,
-  mermaid = mermaidHelpers,
-) {
-  const { isMermaidSvg, mermaidNodeFrom, mermaidNodeElement } = mermaid;
-  let annotationMode = true;
-  let hovered = null;
-  let selected = null;
-  let ignoreNextClick = false;
-  let shadow = null;
-  let counter = 0;
-  const ids = new WeakMap();
+// The artifact SDK is display-only: it renders Mermaid diagrams as whiteboards, keeps the
+// chrome's scroll position across live reloads, and runs the render-time layout audit. It
+// never collects input - feedback happens in the agent conversation, not on the page.
+export function createArtifactSdk(mermaid = mermaidHelpers) {
+  const { isMermaidSvg } = mermaid;
 
-  function uid(el) {
-    if (!ids.has(el)) ids.set(el, String(++counter));
-    return ids.get(el);
-  }
-
-  function escapeAnnotationText(value) {
-    return String(value).replace(
-      /[&<>"']/g,
-      (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char],
-    );
-  }
-
+  // Stable-enough CSS path for reporting which element a layout finding is about.
   function selector(el) {
     if (!el || !el.tagName) return "";
 
@@ -297,37 +158,10 @@ export function createArtifactSdk(
     return parts.join(" > ");
   }
 
-  function context(el) {
-    const base = {
-      uid: uid(el),
-      selector: selector(el),
-      tag: (el.tagName || "").toLowerCase(),
-      text: (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 240),
-    };
-
-    const mermaidNode = mermaidNodeFrom(el, selector);
-    if (mermaidNode) {
-      base.tag = "mermaid-node";
-      base.text = mermaidNode.label || base.text;
-      base.target = mermaidNode;
-    }
-
-    return base;
-  }
-
-  // Hover and click must outline the exact element they annotate. Clicking inside
-  // a Mermaid diagram annotates the whole <g> node, so resolve a raw event target
-  // up to that node before highlighting; every other element annotates itself.
-  function annotationTargetEl(el) {
-    return mermaidNodeElement(el) || el;
-  }
-
   // ---------------------------------------------------------------------------
-  // Mermaid diagram enhancement: pan/zoom in explore mode, freeze in annotate
-  // mode. All of this operates on the rendered SVG only; the saved artifact is
-  // never modified, so a diagram still renders identically when opened directly.
-  // Node identity/label extraction lives in the injected `mermaid` helpers so it
-  // can be unit tested and shared with the server-side target validator.
+  // Mermaid diagram enhancement: pan/zoom on the rendered SVG. All of this
+  // operates on the rendered SVG only; the saved artifact is never modified, so
+  // a diagram still renders identically when opened directly.
   // ---------------------------------------------------------------------------
 
   const mermaidViewports = new WeakMap();
@@ -340,10 +174,10 @@ export function createArtifactSdk(
     return [...svgs];
   }
 
-  // A minimal, dependency-free viewBox-based pan/zoom. Kept small on purpose:
-  // "nodes only" annotation plus freeze-on-annotate means we do not need
-  // momentum, gestures, or a full pan/zoom library here. svg-pan-zoom is a
-  // documented drop-in upgrade if richer interaction is wanted later.
+  // A minimal, dependency-free viewBox-based pan/zoom. Kept small on purpose: a
+  // display surface does not need momentum, gestures, or a full pan/zoom library
+  // here. svg-pan-zoom is a documented drop-in upgrade if richer interaction is
+  // wanted later.
   function createViewport(svg) {
     const bbox = svg.getBBox ? safeBBox(svg) : null;
     const initial = readViewBox(svg) || (bbox ? { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height } : null);
@@ -351,7 +185,6 @@ export function createArtifactSdk(
     svg.setAttribute("viewBox", `${initial.x} ${initial.y} ${initial.w} ${initial.h}`);
 
     const view = { ...initial };
-    let frozen = false;
     let panning = null;
 
     function apply() {
@@ -378,12 +211,11 @@ export function createArtifactSdk(
     }
 
     function onWheel(event) {
-      if (frozen) return;
       event.preventDefault();
       zoomAt(event.clientX, event.clientY, event.deltaY > 0 ? 1.15 : 1 / 1.15);
     }
     function onPointerDown(event) {
-      if (frozen || event.button !== 0) return;
+      if (event.button !== 0) return;
       panning = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y };
       svg.setPointerCapture?.(event.pointerId);
       svg.style.cursor = "grabbing";
@@ -399,7 +231,7 @@ export function createArtifactSdk(
     function onPointerUp(event) {
       panning = null;
       svg.releasePointerCapture?.(event.pointerId);
-      svg.style.cursor = frozen ? "" : "grab";
+      svg.style.cursor = "grab";
     }
 
     svg.addEventListener("wheel", onWheel, { passive: false });
@@ -408,15 +240,10 @@ export function createArtifactSdk(
     svg.addEventListener("pointerup", onPointerUp);
     svg.addEventListener("pointercancel", onPointerUp);
 
-    function setFrozen(next) {
-      frozen = !!next;
-      panning = null;
-      svg.style.cursor = frozen ? "" : "grab";
-      svg.style.touchAction = frozen ? "" : "none";
-    }
-    setFrozen(false);
+    svg.style.cursor = "grab";
+    svg.style.touchAction = "none";
 
-    return { reset, setFrozen };
+    return { reset };
   }
 
   function safeBBox(svg) {
@@ -514,9 +341,9 @@ export function createArtifactSdk(
   window.addEventListener("message", (event) => {
     if (event.source !== parent) return;
     const msg = event.data || {};
-    // While the chrome overlay edits a diagram fullscreen, its inline frame is
-    // parked on about:blank so two editors never autosave the same sidecar;
-    // resume reboots the frame, which re-inits from the latest saved scene.
+    // While the chrome shows a diagram fullscreen, its inline frame is parked on
+    // about:blank so one diagram is never rendered by two live frames at once;
+    // resume reboots the frame, which re-converts from the artifact's source.
     if (msg.type === "lavish:suspendWhiteboard") {
       const target = whiteboardEntryByIndex(msg.diagramIndex);
       if (target) target.iframe.src = "about:blank";
@@ -532,10 +359,7 @@ export function createArtifactSdk(
       embedWhiteboard(svg);
       if (mermaidViewports.has(svg)) continue;
       const viewport = createViewport(svg);
-      if (viewport) {
-        viewport.setFrozen(annotationMode);
-        mermaidViewports.set(svg, viewport);
-      }
+      if (viewport) mermaidViewports.set(svg, viewport);
     }
   }
 
@@ -551,176 +375,8 @@ export function createArtifactSdk(
     else window.setTimeout(run, 50);
   }
 
-  function setMermaidFrozen(frozen) {
-    for (const svg of findMermaidSvgs()) {
-      mermaidViewports.get(svg)?.setFrozen(frozen);
-    }
-  }
-
-  function closestElement(node) {
-    if (!node) return document.body;
-    if (node.nodeType === 1) return node;
-    return node.parentElement || document.body;
-  }
-
-  function nodePath(node, root) {
-    const path = [];
-    let current = node;
-    while (current && current !== root) {
-      const parentNode = current.parentNode;
-      if (!parentNode) break;
-      path.unshift([...parentNode.childNodes].indexOf(current));
-      current = parentNode;
-    }
-    return path;
-  }
-
-  function rangeBoundary(node, offset) {
-    const el = closestElement(node);
-    return {
-      selector: selector(el),
-      path: nodePath(node, el),
-      offset: Number(offset) || 0,
-    };
-  }
-
-  function textSelectionContext(selection) {
-    if (!selection || selection.rangeCount === 0) return null;
-
-    const range = selection.getRangeAt(0);
-    const text = selection.toString().trim().replace(/\s+/g, " ");
-    if (range.collapsed || !text) return null;
-
-    const ancestor = closestElement(range.commonAncestorContainer);
-    if (isLavishUi(ancestor) || isLavishAction(ancestor) || isInteractiveControl(ancestor)) return null;
-
-    const commonAncestorSelector = selector(ancestor);
-    const target = {
-      type: "text-range",
-      text,
-      selector: commonAncestorSelector,
-      commonAncestorSelector,
-      start: rangeBoundary(range.startContainer, range.startOffset),
-      end: rangeBoundary(range.endContainer, range.endOffset),
-    };
-
-    return {
-      uid: "",
-      selector: commonAncestorSelector,
-      tag: "text",
-      text: text.slice(0, 240),
-      target,
-      element: ancestor,
-      range: range.cloneRange(),
-    };
-  }
-
   function isLavishUi(el) {
     return !!(el && el.closest && el.closest("[data-lavish-ui]"));
-  }
-
-  function isLavishAction(el) {
-    return !!(el && el.closest && el.closest("[data-lavish-action]"));
-  }
-
-  // Native interactive controls (radios, checkboxes, inputs, selects, buttons,
-  // labels, disclosure summaries, editable regions) should toggle/focus/type
-  // natively instead of triggering annotation, just like elements marked with
-  // data-lavish-action.
-  function isInteractiveControl(el) {
-    return isNativeInteractive(el);
-  }
-
-  function highlightElement(el) {
-    if (!el) return;
-    el.style.outline = "var(--lavish-annotate-outline,2px solid #f4c95d)";
-    el.style.outlineOffset = "var(--lavish-annotate-offset,2px)";
-  }
-
-  function clearHighlight(el) {
-    if (el) el.style.outline = "";
-  }
-
-  function clearTextHighlight() {
-    if (!shadow) return;
-    for (const el of [...shadow.querySelectorAll(".lavish-text-highlight")]) el.remove();
-  }
-
-  function highlightTextRange(range) {
-    clearTextHighlight();
-    const root = ensureShadow();
-    for (const rect of [...range.getClientRects()]) {
-      if (rect.width <= 0 || rect.height <= 0) continue;
-      const mark = document.createElement("div");
-      mark.className = "lavish-text-highlight";
-      mark.style.left = rect.left + "px";
-      mark.style.top = rect.top + "px";
-      mark.style.width = rect.width + "px";
-      mark.style.height = rect.height + "px";
-      root.appendChild(mark);
-    }
-  }
-
-  function setAnnotationMode(enabled) {
-    annotationMode = !!enabled;
-    let style = document.getElementById("lavish-cursor-style");
-    if (annotationMode && !style) {
-      style = document.createElement("style");
-      style.id = "lavish-cursor-style";
-      style.textContent =
-        ":root{--lavish-accent:#f4c95d;--lavish-annotate-outline:2px solid var(--lavish-accent);--lavish-annotate-offset:2px}*{cursor:default!important}[data-lavish-action],[data-lavish-action] *{cursor:pointer!important}input,textarea,[contenteditable]:not([contenteditable='false']){cursor:text!important}button,select,label,option,input[type='button'],input[type='submit'],input[type='reset'],input[type='checkbox'],input[type='radio'],input[type='file'],input[type='color'],input[type='range'],input[type='image']{cursor:pointer!important}";
-      document.head.appendChild(style);
-    }
-    if (!annotationMode && style) style.remove();
-    if (!annotationMode) closeCard();
-
-    // Freeze Mermaid pan/zoom while annotating so nodes sit at stable screen
-    // positions and a click resolves cleanly to one node instead of panning.
-    setMermaidFrozen(annotationMode);
-  }
-
-  function queuePrompt(prompt, options = {}) {
-    const originElement = options.element || document.activeElement || document.body;
-    /** @type {{ uid: string, prompt: string, selector: string, tag: string, text: string, target?: unknown, _lavishQueueKey?: string }} */
-    const item = {
-      ...context(originElement),
-      prompt: String(prompt || ""),
-    };
-    const queueKey = typeof deriveQueueKey === "function" ? deriveQueueKey(originElement, options) : "";
-    if (queueKey) item._lavishQueueKey = String(queueKey);
-
-    if (options.uid) item.uid = String(options.uid);
-    if (options.selector) item.selector = String(options.selector);
-    if (options.tag) item.tag = String(options.tag);
-    if (options.text) item.text = String(options.text);
-    if (options.target) item.target = options.target;
-    if (options.data) item.prompt += "\n\nContext data:\n" + JSON.stringify(options.data, null, 2);
-
-    parent.postMessage({ type: "lavish:queuePrompt", prompt: item }, "*");
-  }
-
-  function sendQueuedPrompts() {
-    parent.postMessage({ type: "lavish:sendQueuedPrompts" }, "*");
-  }
-
-  function endSession() {
-    parent.postMessage({ type: "lavish:endSession" }, "*");
-  }
-
-  function snapshot() {
-    const lines = [];
-
-    function walk(el, depth) {
-      if (!(el instanceof Element) || depth > 6 || isLavishUi(el)) return;
-
-      const c = context(el);
-      const name = c.text ? ' "' + c.text.slice(0, 80).replace(/"/g, "'") + '"' : "";
-      lines.push("  ".repeat(depth) + "uid=" + c.uid + " " + c.tag + name);
-      for (const child of el.children) walk(child, depth + 1);
-    }
-
-    walk(document.body, 0);
-    return lines.join("\n");
   }
 
   const layoutAuditSettleMs = 180;
@@ -1436,133 +1092,12 @@ export function createArtifactSdk(
     window.addEventListener("transitionend", scheduleLayoutAudit, { passive: true });
   }
 
-  function ensureShadow() {
-    if (shadow) return shadow;
-
-    const host = document.createElement("div");
-    host.className = "lavish-annotation-root";
-    host.setAttribute("data-lavish-ui", "annotation-root");
-    document.documentElement.appendChild(host);
-
-    shadow = host.attachShadow({ mode: "open" });
-    const style = document.createElement("style");
-    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}`;
-    shadow.appendChild(style);
-    return shadow;
-  }
-
-  function closeCard() {
-    if (shadow) {
-      for (const el of [...shadow.querySelectorAll(".lavish-annotation-card")]) el.remove();
-    }
-    clearHighlight(hovered);
-    clearHighlight(selected);
-    hovered = null;
-    clearTextHighlight();
-    selected = null;
-  }
-
-  function showAnnotationCard(target, options = {}) {
-    const root = ensureShadow();
-    closeCard();
-
-    const c = options.context || context(target);
-    let anchor = target;
-    if (options.range) {
-      highlightTextRange(options.range);
-    } else {
-      anchor = annotationTargetEl(target);
-      selected = anchor;
-      highlightElement(selected);
-    }
-
-    const rect = options.range ? options.range.getBoundingClientRect() : anchor.getBoundingClientRect();
-    const card = document.createElement("div");
-    card.className = "lavish-annotation-card";
-    const nodeLabel = c.tag === "mermaid-node" ? c.target?.label || c.text || "" : "";
-    const heading =
-      c.tag === "text"
-        ? "Annotate text"
-        : c.tag === "mermaid-node"
-          ? "Annotate node" + (nodeLabel ? ": " + escapeAnnotationText(nodeLabel) : "")
-          : "Annotate &lt;" + c.tag + "&gt;";
-    const placeholder =
-      c.tag === "text"
-        ? "Tell the agent what to change about this text..."
-        : c.tag === "mermaid-node"
-          ? "Tell the agent what to change about this diagram node..."
-          : "Tell the agent what to change about this element...";
-    card.innerHTML =
-      '<div class="lavish-heading">' +
-      heading +
-      '</div><textarea placeholder="' +
-      placeholder +
-      '"></textarea><div class="lavish-hint">Enter to queue &middot; ' +
-      (/Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl") +
-      '+Enter to send now</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><button class="lavish-send" type="button">Queue</button></div>';
-    root.appendChild(card);
-
-    const left = Math.min(Math.max(12, rect.left), window.innerWidth - card.offsetWidth - 12);
-    const top = Math.min(Math.max(12, rect.bottom + 8), window.innerHeight - card.offsetHeight - 12);
-    card.style.left = left + "px";
-    card.style.top = top + "px";
-
-    const textarea = /** @type {HTMLTextAreaElement | null} */ (card.querySelector("textarea"));
-    const cancelButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-cancel"));
-    const sendButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-send"));
-    if (!textarea || !cancelButton || !sendButton) return;
-
-    cancelButton.onclick = closeCard;
-    sendButton.onclick = () => {
-      const prompt = textarea.value.trim();
-      if (prompt) queuePrompt(prompt, { ...c, queueKey: "" });
-      closeCard();
-    };
-    textarea.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        const sendNow = (event.ctrlKey || event.metaKey) && !!textarea.value.trim();
-        sendButton.click();
-        // postMessage delivery is ordered, so the queued prompt lands before the send.
-        if (sendNow) sendQueuedPrompts();
-      }
-    });
-    setTimeout(() => textarea.focus(), 0);
-  }
-
-  /** @type {Window & { lavish?: unknown }} */ (window).lavish = {
-    queuePrompt,
-    sendQueuedPrompts,
-    endSession,
-    getQueuedPrompts: () => [],
-    setStatus: (message) => parent.postMessage({ type: "lavish:status", message: String(message) }, "*"),
-    snapshot,
-  };
-
   window.addEventListener("message", (event) => {
     const msg = event.data || {};
-    if (msg.type === "lavish:setAnnotationMode") setAnnotationMode(msg.enabled);
-    if (msg.type === "lavish:requestSnapshot") {
-      parent.postMessage({ type: "lavish:snapshot", snapshot: snapshot() }, "*");
-    }
     if (msg.type === "lavish:restoreScroll") {
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);
     }
   });
-
-  // Capture phase so the mode hotkey fires no matter where focus is inside the artifact -
-  // including a checkbox, button, link, or the annotation-card textarea - without disturbing
-  // normal typing. This SDK doesn't own the mode state; it asks the chrome to toggle the same
-  // state the on-screen switch drives, via the same postMessage protocol as setAnnotationMode.
-  document.addEventListener(
-    "keydown",
-    (event) => {
-      if (!isModeToggleHotkeyEvent(event)) return;
-      event.preventDefault();
-      parent.postMessage({ type: "lavish:toggleAnnotationMode" }, "*");
-    },
-    true,
-  );
 
   // Report scroll position to the chrome so it can be restored across hot reloads.
   // The iframe is sandboxed without same-origin, so the chrome can't read scrollY directly.
@@ -1579,78 +1114,6 @@ export function createArtifactSdk(
     { passive: true },
   );
 
-  document.addEventListener(
-    "mouseover",
-    (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
-      const target = annotationTargetEl(event.target);
-      if (target === selected) return;
-      if (hovered && hovered !== selected) clearHighlight(hovered);
-      hovered = target;
-      highlightElement(hovered);
-    },
-    true,
-  );
-
-  document.addEventListener(
-    "mouseout",
-    () => {
-      if (hovered && hovered !== selected) {
-        clearHighlight(hovered);
-        hovered = null;
-      }
-    },
-    true,
-  );
-
-  document.addEventListener(
-    "mouseup",
-    (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
-
-      const c = textSelectionContext(document.getSelection());
-      if (!c) return;
-
-      ignoreNextClick = true;
-      showAnnotationCard(c.element, { context: c, range: c.range });
-    },
-    true,
-  );
-
-  document.addEventListener(
-    "click",
-    (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (ignoreNextClick) {
-        ignoreNextClick = false;
-        return;
-      }
-      showAnnotationCard(event.target);
-    },
-    true,
-  );
-
-  setAnnotationMode(annotationMode);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", startLayoutAudit, { once: true });
   } else {
