@@ -21,48 +21,21 @@ import { resolveDesignAssetPath, serve } from "./server.js";
 import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
-const COMMANDS = new Set(["open", "poll", "end", "stop", "server", "playbook", "design", "setup", "export", "share"]);
+const COMMANDS = new Set(["open", "stop", "server", "playbook", "design", "setup", "export", "share"]);
 // SDK-reserved built-ins (e.g. `update`) must reach runAxiCli untouched; otherwise
 // the bare-arg normalization below would rewrite them into the hidden `open` command.
 const RESERVED = new Set(RESERVED_COMMANDS);
 const DESCRIPTION =
-  "Lavish Editor helps agents turn rich HTML artifacts into collaborative human review surfaces. Whenever you are about to give user a complex response that will be easier to understand via a rich / interactive page, consider using Lavish Editor. " +
-  "First generate an interactive HTML artifact according to user request, then run `lavish-axi <html-file>` so the user can visually review it, annotate elements or selected text, queue prompts, and send feedback back through `lavish-axi poll`.";
-export const POLL_WAKE_PATH_RULES = Object.freeze([
-  "Keep the poll in the foreground by default and let it return the feedback directly to the agent.",
-  "A background poll is allowed only through a harness-native tracked background-job facility whose completion result is guaranteed to resume or notify the same agent.",
-  "Never use `nohup`, shell `&`, `disown`, redirected fire-and-forget processes, or a detached terminal without an explicit verified callback merely to keep polling alive.",
-  "If the harness has no completion-aware background facility, use the foreground poll or first wire a verified wake callback into the surrounding supervisor.",
-  "Do not tell the user the artifact is being monitored until that wake path is live.",
-  "If the poll gets killed or times out anyway, just re-run it - queued feedback is never lost.",
-]);
-export const POLL_SEND_AND_END_RULE =
-  "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
-const CODEX_POLL_WAKE_PATH_GUIDANCE =
-  "Codex detected: completed background tasks may not resume Codex automatically, so keep the poll attached to the active turn.";
+  "Lavish turns an agent's complex or visual response into a rich HTML page displayed in the user's browser. Whenever you are about to give the user a response that is easier to understand as a page than as prose, build the page and show it with Lavish. " +
+  "Generate an interactive HTML artifact, then run `lavish-axi <html-file>` to display it. That command returns immediately - Lavish is a display surface, not a feedback channel, so continue the conversation here once the page is open.";
 // Inlined at build time from package.json; falls back to reading package.json so source-run tests work.
 export const VERSION =
   process.env.LAVISH_AXI_BUILD_VERSION ||
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
-export function detectInvokingAgent(env = process.env) {
-  return ["CODEX_SANDBOX", "CODEX_THREAD_ID"].some((key) => Object.hasOwn(env, key)) ? "codex" : "generic";
-}
-
-export function shouldNarratePollWaitTicks({ isTTY }) {
-  return Boolean(isTTY);
-}
-
-export function pollExecutionGuidance({ agent = "generic" } = {}) {
-  const sharedGuidance = POLL_WAKE_PATH_RULES.join(" ");
-  const agentGuidance = agent === "codex" ? ` ${CODEX_POLL_WAKE_PATH_GUIDANCE}` : "";
-  return `${sharedGuidance}${agentGuidance}`;
-}
-
 export async function run(argv) {
   await ensureStateDir();
   const normalizedArgv = normalizeArgv(argv);
-  const agent = detectInvokingAgent(process.env);
   const isTopLevelHelp = argv.length === 1 && argv[0] === "--help";
   const command = telemetryCommandName(argv);
   const telemetry = initDefaultTelemetry({
@@ -77,18 +50,15 @@ export async function run(argv) {
       description: DESCRIPTION,
       version: VERSION,
       argv: isTopLevelHelp ? [] : normalizedArgv,
-      topLevelHelp: createTopLevelHelp({ agent }),
+      topLevelHelp: createTopLevelHelp(),
       home: async () =>
         createHomeOutput({
           bin: process.argv[1] || "lavish-axi",
-          sessions: isTopLevelHelp ? [] : await visibleSessions(),
+          sessions: isTopLevelHelp ? [] : await listOpenSessions(),
           includeSessions: !isTopLevelHelp,
-          agent,
         }),
       commands: {
         open: openCommand,
-        poll: pollCommand,
-        end: endCommand,
         stop: stopCommand,
         playbook: playbookCommand,
         design: designCommand,
@@ -97,7 +67,7 @@ export async function run(argv) {
         export: exportCommand,
         share: shareCommand,
       },
-      getCommandHelp: (command) => getCommandHelp(command, { agent }),
+      getCommandHelp,
     });
     telemetry.track("command", { command, status: "success" });
   } catch (error) {
@@ -137,7 +107,7 @@ export function telemetryCommandName(argv) {
   return normalized[0] && !normalized[0].startsWith("-") ? normalized[0] : "home";
 }
 
-export function createHomeOutput({ bin, sessions, includeSessions = true, agent = "generic" }) {
+export function createHomeOutput({ bin, sessions, includeSessions = true }) {
   return {
     bin: collapseHomeDirectory(bin, os.homedir()),
     description: DESCRIPTION,
@@ -145,9 +115,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true, agent 
       ? {
           sessions: sessions.map((session) => ({
             file: session.file,
-            status: session.status,
             url: session.url,
-            pending_prompts: session.pending_prompts || 0,
           })),
         }
       : {}),
@@ -160,18 +128,18 @@ export function createHomeOutput({ bin, sessions, includeSessions = true, agent 
     ],
     playbooks: listPlaybooks(),
     help: [
-      "Run `lavish-axi <html-file>` to open or resume a Lavish Editor session. If the user explicitly ended the session from the browser, this refuses to reopen it and explains why instead of reopening uninvited - pass `--reopen` only when the user asks for further review or something important needs their visual attention",
+      "Run `lavish-axi <html-file>` to display an artifact in the user's browser. It opens (or refreshes) the page and returns right away - there is nothing to poll, subscribe to, or wait for. Tell the user the page is open and keep talking to them in this conversation; they will respond to you here, not in the browser",
       "Unless the user specifies another location, create HTML artifacts in the current working directory under `.lavish/`",
       "Lavish serves the html file through a local express.js server. If your html needs to reference other filesystem assets such as images, CSS, fonts, and local scripts, copy them into the same directory as the HTML file, then reference them with relative paths from that directory. Never prepend `/` to those asset paths - root paths won't work",
-      `Run \`lavish-axi poll <html-file>\` to wait for user feedback or browser-proven severe layout failures. It long-polls and stays silent until the user sends feedback, ends the session, or the real browser proves meaningful content is inaccessible or unusable, so leave it running - never kill it. Repair and re-check every returned layout failure before involving the human; cosmetic, intentional, transient, tiny, and uncertain observations stay silent. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}`,
-      'Rendered Mermaid diagrams in `.mermaid` containers become embedded, editable Excalidraw whiteboards in the browser (click a diagram to unlock editing; a Fullscreen action opens it over the whole viewport) - flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other types embed as an image to draw on. Scenes autosave locally; when a reload detects a changed Mermaid source, the reviewer explicitly chooses to re-convert and discard saved edits or keep editing the saved scene. Standalone and exported copies still render plain Mermaid. Queue feedback adds a prompt to the Conversation panel; when the user sends it, poll returns a tag "whiteboard" prompt carrying a bounded edit summary plus local scenePath (.excalidraw JSON) and previewPath (PNG) files - read the summary first, open the files only when needed, then apply the edits by updating the Mermaid source in the artifact (never try to write the scene back)',
-      "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
+      "Before returning, `lavish-axi <html-file>` waits a few seconds for the real browser's render-time layout audit and includes any proven severe layout failures as `layout_warnings`. Repair every returned failure and re-run the command to re-check before telling the user the page is ready. Cosmetic, intentional, transient, tiny, and uncertain observations never appear; an absent audit reports no findings rather than a defect",
+      "Editing the artifact file live-reloads the open page, so iterating on it needs no extra command - the browser updates itself and keeps its scroll position",
+      "Rendered Mermaid diagrams in `.mermaid` containers are displayed as formally styled Excalidraw drawings in the browser (a Fullscreen action opens one over the whole viewport); flowchart, sequence, class, ER, and state diagrams convert to shapes, other types render as an image. They are view-only - the Mermaid source in the artifact stays the single representation of the diagram, and standalone or exported copies render plain Mermaid",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
       "Run `lavish-axi share <html-file> [--password <pw>] [--token <t>]` to publish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and get back a visitable URL. Shares are PUBLIC by default, so anyone with the link can open them. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Local assets are inlined; remote refs load over the network. It returns the url plus a secret update_key for managing the page later. Use --token or LAVISH_AXI_HTML_APP_TOKEN only when you have an optional bearer token; it is never required. Users can also publish from the browser chrome's overflow menu",
-      "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
+      "Run `lavish-axi stop` to shut down the background server (it also self-stops when no browser has been connected for a while). Closing the browser tab is how a user is done with an artifact; there is no session to end",
       `Run \`lavish-axi playbook <playbook_id>\` for focused artifact guidance. ${PLAYBOOK_ROUTER_HELP}`,
       DESIGN_SYSTEM_HINT,
-      "Use lavish-axi when the user asks for a visual artifact, HTML explainer, interactive prototype, review surface, product or technical plan, comparison, report, or browser-based feedback loop",
+      "Use lavish-axi when the user asks for a visual artifact, HTML explainer, interactive prototype, product or technical plan, comparison, report, diagram, or anything easier to grasp as a page than as prose",
     ],
   };
 }
@@ -195,21 +163,21 @@ export function createPlaybookOutput(args) {
   return { playbook };
 }
 
-export function createOpenOutput({ file, url, status, agent = "generic" }) {
+/**
+ * @param {{ file: string, url: string, status: string, layoutWarnings?: any[] }} params
+ * @returns {{ session: { file: string, url: string, status: string }, layout_warnings?: any[], next_step: string }}
+ */
+export function createOpenOutput({ file, url, status, layoutWarnings = [] }) {
+  const warnings = Array.isArray(layoutWarnings)
+    ? layoutWarnings.filter((warning) => warning && String(warning.severity || "").toLowerCase() === "error")
+    : [];
   return {
     session: { file, url, status },
-    next_step: `Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file}\`. This command long-polls until the user sends feedback, ends the session, or the real browser proves a severe layout failure through the in-iframe audit, and it stays silent the whole time - that is normal, never kill it. If layout_warnings arrive, follow the poll response's next_step: repair and re-check the inaccessible or unusable content before involving the human. Cosmetic, intentional, transient, tiny, and uncertain observations stay silent. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance({ agent })} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
-  };
-}
-
-// Shown when a plain `lavish-axi <file>` targets a session the user explicitly ended from the
-// browser. Reviving it silently would reopen a browser window the human deliberately closed, so
-// this refuses and requires the explicit --reopen opt-in instead of erroring - the session
-// staying closed is the correct, idempotent outcome unless the agent has a real reason to reopen.
-export function createUserEndedOpenOutput({ file, url }) {
-  return {
-    session: { file, url, status: "user-ended" },
-    next_step: `The user explicitly ended this Lavish Editor session from the browser, so \`lavish-axi ${file}\` did not reopen it. Do not reopen unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    ...(warnings.length > 0 ? { layout_warnings: warnings } : {}),
+    next_step:
+      warnings.length > 0
+        ? `${warnings.length} proven severe layout failure${warnings.length === 1 ? "" : "s"} - the real browser reports that meaningful content or a required control in ${file} is inaccessible or unusable. Repair it, then run \`lavish-axi ${file}\` again to re-check the audit before telling the user the page is ready.`
+        : `${file} is displayed at ${url}. Lavish is a display surface, not a feedback channel: nothing is running, there is nothing to poll or wait for, and the user will reply to you in this conversation rather than in the browser. Tell them the page is open, summarize what it shows, and continue here. Editing the file live-reloads the open page, so you can iterate without re-running this command.`,
   };
 }
 
@@ -221,219 +189,56 @@ async function openCommand(args) {
   await assertHtmlFile(file);
   const absolute = await canonicalFile(file);
   const noGate = args.includes("--no-gate");
-  const reopen = args.includes("--reopen");
   const baseUrl = await ensureServer({ forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || "") });
-  const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate, reopen });
-  if (response.status === "user-ended") {
-    return createUserEndedOpenOutput({ file: absolute, url: response.url });
-  }
+  const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate });
+  let opened = false;
   if (shouldOpenBrowser(args, process.env)) {
     try {
       const open = (await import("open")).default;
       await open(response.url);
+      opened = true;
     } catch {
       response.status = "ready";
     }
   }
+  // Only a page that is actually loading can produce an audit, so skip the wait entirely when
+  // no browser was launched - otherwise every --no-open call would stall for the full budget.
+  const layoutWarnings = opened
+    ? await waitForLayoutAudit(baseUrl, response.key || sessionKey(absolute), layoutAuditWaitMs(process.env))
+    : [];
   return createOpenOutput({
     file: absolute,
     url: response.url,
     status: response.status || "opened",
-    agent: detectInvokingAgent(process.env),
+    layoutWarnings,
   });
+}
+
+// How long to wait for the browser's verdict before returning anyway. Set
+// LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS to 0/off to return as soon as the page is opened.
+export function layoutAuditWaitMs(env = process.env) {
+  const raw = env.LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS?.trim();
+  if (raw === undefined || raw === "") return null;
+  if (raw === "0" || raw.toLowerCase() === "off") return 0;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+// Best effort by design: an audit that does not arrive is uncertainty, not evidence of a
+// defect, so a timeout or a failed request reports no findings rather than failing the open.
+async function waitForLayoutAudit(baseUrl, key, timeoutMs) {
+  if (timeoutMs === 0) return [];
+  const query = timeoutMs === null ? "" : `?timeoutMs=${encodeURIComponent(String(timeoutMs))}`;
+  try {
+    const response = await fetchJson(`${baseUrl}/api/${key}/layout-audit${query}`);
+    return Array.isArray(response.layout_warnings) ? response.layout_warnings : [];
+  } catch {
+    return [];
+  }
 }
 
 export function shouldOpenBrowser(args, env) {
   return !args.includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
-}
-
-async function pollCommand(args) {
-  const file = firstPositionalArg(args, ["--agent-reply", "--timeout-ms"]);
-  if (!file) {
-    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi poll <html-file>`"]);
-  }
-  const absolute = await canonicalFile(file);
-  const baseUrl = await ensureServer();
-  const agentReply = flagValue(args, "--agent-reply");
-  if (agentReply) {
-    await postJson(`${baseUrl}/api/${sessionKey(absolute)}/agent-reply`, { text: agentReply });
-  }
-  const timeoutMs = flagValue(args, "--timeout-ms");
-  const timeoutQuery = timeoutMs ? `&timeoutMs=${encodeURIComponent(timeoutMs)}` : "";
-  // The indefinite poll looks hung from the agent's side (stdout stays empty until the user
-  // acts), so narrate the wait on stderr and leave re-run guidance behind if the agent's
-  // harness kills the process anyway. stderr keeps the stdout JSON contract intact.
-  // The one-shot banner is that "not hung" signal and stays unconditional; only the recurring
-  // ticks - one line per minute, unbounded - are gated on an interactive stderr so piped,
-  // merged agent captures do not accumulate them.
-  const onPollSignal = (signal) => {
-    process.stderr.write(`\n${pollInterruptedText(absolute)}\n`);
-    process.exit(signal === "SIGINT" ? 130 : 143);
-  };
-  if (!timeoutMs) {
-    // Register before the banner write below: a harness that kills the poll as soon as the
-    // banner appears can deliver the signal before the next statement runs, and without a
-    // handler the default disposition exits silently with no re-run guidance.
-    process.on("SIGINT", onPollSignal);
-    process.on("SIGTERM", onPollSignal);
-  }
-  const waitReporter = timeoutMs
-    ? null
-    : startPollWaitReporter({
-        file: absolute,
-        narrateTicks: shouldNarratePollWaitTicks({ isTTY: process.stderr.isTTY }),
-      });
-  try {
-    const response = await fetchJson(`${baseUrl}/api/poll?file=${encodeURIComponent(absolute)}${timeoutQuery}`, {
-      retries: 3,
-      retryDelayMs: 500,
-    });
-    return createPollOutput({ file: absolute, response, agent: detectInvokingAgent(process.env) });
-  } finally {
-    waitReporter?.stop();
-    if (!timeoutMs) {
-      process.off("SIGINT", onPollSignal);
-      process.off("SIGTERM", onPollSignal);
-    }
-  }
-}
-
-export function pollWaitBannerText(file) {
-  return (
-    `[lavish-axi] Long-polling for user feedback or layout_warnings on ${file}. This stays silent until the user sends feedback, ends the session, or the browser reports fresh layout_warnings - leave it running. ` +
-    `If it gets killed or times out, re-run \`lavish-axi poll ${file}\` - queued feedback is never lost.`
-  );
-}
-
-export function pollWaitTickText(elapsedMs) {
-  const minutes = Math.round(elapsedMs / 60_000);
-  return `[lavish-axi] Still waiting for user feedback (${minutes}m). Also waiting for fresh layout_warnings. Leave this running until the user acts or the browser reports fresh layout_warnings.`;
-}
-
-export function pollInterruptedText(file) {
-  return (
-    `[lavish-axi] Poll interrupted before user feedback arrived. The user may still be reviewing - ` +
-    `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost.`
-  );
-}
-
-export function startPollWaitReporter({
-  file,
-  write = (line) => {
-    process.stderr.write(line);
-  },
-  intervalMs = 60_000,
-  narrateTicks = true,
-}) {
-  write(`${pollWaitBannerText(file)}\n`);
-  if (!narrateTicks) return { stop: () => {} };
-  let elapsedMs = 0;
-  const timer = setInterval(() => {
-    elapsedMs += intervalMs;
-    write(`${pollWaitTickText(elapsedMs)}\n`);
-  }, intervalMs);
-  timer.unref?.();
-  return { stop: () => clearInterval(timer) };
-}
-
-/**
- * @returns {{
- *   session: { file: string, status: string, session_ended?: boolean, ended_by?: string },
- *   next_step?: string,
- *   dom_snapshot?: string,
- *   prompts?: any[],
- *   layout_warnings?: any[],
- * }}
- */
-export function createPollOutput({ file, response, agent = "generic" }) {
-  if (response.status === "missing") {
-    throw new AxiError("No active Lavish Editor session for this file", "NOT_FOUND", [
-      `Run \`lavish-axi ${file}\` first`,
-    ]);
-  }
-  if (response.status === "feedback") {
-    const layoutWarnings = Array.isArray(response.layout_warnings)
-      ? response.layout_warnings.filter(
-          (warning) => warning && String(warning.severity || "").toLowerCase() === "error",
-        )
-      : [];
-    const sessionEnded = Boolean(response.session_ended);
-    const endedBy = typeof response.ended_by === "string" ? response.ended_by : undefined;
-    return {
-      session: {
-        file,
-        status: "feedback",
-        ...(sessionEnded ? { session_ended: true, ...(endedBy ? { ended_by: endedBy } : {}) } : {}),
-      },
-      dom_snapshot: response.dom_snapshot || "",
-      prompts: response.prompts || [],
-      ...(layoutWarnings.length > 0 ? { layout_warnings: layoutWarnings } : {}),
-      next_step: createFeedbackNextStep(file, layoutWarnings, sessionEnded, endedBy, response.prompts || [], agent),
-    };
-  }
-  if (response.status === "ended") {
-    return {
-      session: { file, status: "ended", ...(response.ended_by ? { ended_by: response.ended_by } : {}) },
-      next_step: createEndedNextStep(file, response.ended_by),
-    };
-  }
-  return {
-    session: { file, status: response.status || "waiting" },
-    next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.`,
-  };
-}
-
-function createFeedbackNextStep(file, layoutWarnings, sessionEnded, endedBy, prompts = [], agent = "generic") {
-  const count = layoutWarnings.length;
-  const whiteboardNote = prompts.some((prompt) => prompt && prompt.tag === "whiteboard")
-    ? `This feedback includes whiteboard edits (tag "whiteboard"): read the edit summary in the prompt text first, and only when it is not enough, open the target's scenePath (.excalidraw scene JSON) or previewPath (PNG) local files for detail. The artifact's Mermaid source stays authoritative - apply the edits by updating the Mermaid text in ${file} (Lavish live-reloads it); never try to write the .excalidraw scene back. `
-    : "";
-  if (sessionEnded) {
-    const layoutNote =
-      count > 0
-        ? endedBy === "user"
-          ? `${count} proven severe layout failure${count === 1 ? "" : "s"} arrived alongside this final feedback. Repair the inaccessible or unusable content in ${file}, then open it directly at the affected viewport and confirm the content or control is visible and usable without reopening this ended Lavish session. `
-          : `${count} proven severe layout failure${count === 1 ? "" : "s"} arrived alongside this final feedback. Repair the inaccessible or unusable content in ${file}, then run \`lavish-axi ${file}\` to open a fresh session and re-check the real-browser audit. `
-        : "";
-    if (endedBy === "user") {
-      const reopenNote =
-        count > 0
-          ? ""
-          : ` Only run \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
-      return `${layoutNote}${whiteboardNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
-    }
-    return `${layoutNote}${whiteboardNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
-  }
-  const layoutPrefix =
-    count > 0 ? layoutWarningsPrefix(file, layoutWarnings) : `Apply the requested changes to ${file}. `;
-  return `${layoutPrefix}${whiteboardNote}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms unless the user ended the session. The poll waits silently until the user sends more feedback, ends the session, or reports fresh layout_warnings - never kill it. ${pollExecutionGuidance({ agent })}`;
-}
-
-// Layout findings reach this path only after the browser has direct, stable evidence that
-// meaningful content or a required control is inaccessible or unusable. Cosmetic and uncertain
-// observations are discarded before storage, so every returned failure still requires repair.
-function layoutWarningsPrefix(file, layoutWarnings) {
-  const count = layoutWarnings.length;
-  const plural = count === 1 ? "" : "s";
-  return `${count} proven severe layout failure${plural} detected - repair the inaccessible or unusable content in ${file}, then re-check in the browser before involving the human. Lavish live-reloads the artifact automatically after you save, so you do not need to re-run \`lavish-axi ${file}\` for this. `;
-}
-
-function createEndedNextStep(file, endedBy) {
-  if (endedBy === "user") {
-    return `The user ended this Lavish Editor session. Stop polling ${file} - do not run \`lavish-axi ${file}\` to reopen it. Deliver any remaining updates directly in this conversation instead. Only reopen with \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
-  }
-  return `This Lavish Editor session for ${file} has ended. Stop polling. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
-}
-
-async function endCommand(args) {
-  const file = firstPositionalArg(args);
-  if (!file) {
-    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi end <html-file>`"]);
-  }
-  const absolute = await canonicalFile(file);
-  const baseUrl = await ensureServer();
-  const response = await postJson(`${baseUrl}/api/end`, { file: absolute });
-  return { session: { file: absolute, status: response.status || "ended" } };
 }
 
 // Produce a portable copy of an artifact: one HTML file with its LOCAL assets (relative-path
@@ -743,9 +548,9 @@ async function serverCommand(args) {
   return "";
 }
 
-async function visibleSessions() {
+async function listOpenSessions() {
   const store = new SessionStore(stateFile());
-  return (await store.listSessions()).filter((session) => session.status !== "ended");
+  return store.listSessions();
 }
 
 async function assertHtmlFile(file) {
@@ -1052,26 +857,24 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function getCommandHelp(command, { agent = "generic" } = {}) {
-  return createCommandHelp({ agent })[command] || null;
+export function getCommandHelp(command) {
+  return createCommandHelp()[command] || null;
 }
 
-function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or the browser proves a severe layout failure, staying silent while it waits - never kill it. Repair and re-check every returned layout failure before involving the human; cosmetic and uncertain observations are never returned. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
+function createTopLevelHelp() {
+  return `lavish-axi - Lavish AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate]\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n\n${DESIGN_SYSTEM_HINT}\n\nNote: Lavish displays artifacts; it never collects feedback. \`lavish-axi <html-file>\` opens the page, waits briefly for the browser's layout audit, and returns - there is nothing to poll or keep alive. Repair every returned layout failure and re-run the command to re-check; cosmetic and uncertain observations are never returned.\n\n`;
 }
 
-function createCommandHelp({ agent = "generic" } = {}) {
+function createCommandHelp() {
   return {
-    open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
-    poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts and browser-proven severe layout failures, then returns them to the agent as layout_warnings. It stays silent while it waits - that is normal, never kill it. Repair and re-check every returned layout failure before involving the human; cosmetic and uncertain observations are never returned. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
-    end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
-    export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
-    share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
-    stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
+    open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate]\n\nDisplay an HTML artifact in the user's browser and return. Use --no-open when you only need the server and session to exist without opening another browser window; the layout-audit wait is skipped too, since no page is loading. Use --no-gate to skip the open-time layout curtain for this browser open. Set LAVISH_AXI_LAYOUT_AUDIT_WAIT_MS to change how long the open waits for the browser's audit (0 or "off" returns immediately).\n`,
+    export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The injected Lavish SDK is never included in an export.\n`,
+    share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The injected Lavish SDK is never included.\n`,
+    stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish server. The server also stops itself when no browser has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session is deleted with nothing connected.\n`,
     playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
     setup: `Usage: lavish-axi setup hooks\n\nInstall or repair agent SessionStart hooks for lavish-axi ambient context in Claude Code, Codex, OpenCode, and GitHub Copilot CLI. Restart your agent session afterward to receive the context.\n`,
-    server: `Usage: lavish-axi server [--port 4387] [--verbose]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nLAVISH_AXI_HOST sets the bind address (default 127.0.0.1; a wildcard 0.0.0.0 or :: binds every interface). Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address, or loopback when bound to a wildcard). See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
+    server: `Usage: lavish-axi server [--port 4387] [--verbose]\n\nRun the local Lavish server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nLAVISH_AXI_HOST sets the bind address (default 127.0.0.1; a wildcard 0.0.0.0 or :: binds every interface). Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address, or loopback when bound to a wildcard). See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
   };
 }
 
