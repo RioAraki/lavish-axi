@@ -1947,7 +1947,7 @@ test("POST /api/batch-delete tolerates a missing or malformed keys list", async 
       body: JSON.stringify({ keys: "not-an-array" }),
     });
 
-    assert.deepEqual(await res.json(), { status: "deleted", deleted: [], count: 0 });
+    assert.deepEqual(await res.json(), { status: "deleted", deleted: [], skipped: [], count: 0 });
     assert.equal(existsSync(artifact), true);
   } finally {
     await server.close();
@@ -2158,6 +2158,135 @@ test("sessions with the same file name get distinct slugs that both resolve", as
     const reopened = await openSession(base, first);
     assert.equal(reopened.slug, "plan");
     assert.equal(reopened.url, `${base}/session/plan`);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("createIndexHtml renders a favorite toggle on every card and marks favorited ones", () => {
+  const html = createIndexHtml(
+    [
+      indexEntry({ key: "k1", title: "Pinned", file: "/home/dev/plans/pinned.html", favorite: true }),
+      indexEntry({ key: "k2", title: "Plain", file: "/home/dev/plans/plain.html" }),
+    ],
+    { home: "/home/dev" },
+  );
+
+  assert.match(html, /<button class="card-fav is-on"[^>]*data-favorite-key="k1"[^>]*aria-pressed="true"/);
+  assert.match(html, /<button class="card-fav"[^>]*data-favorite-key="k2"[^>]*aria-pressed="false"/);
+  assert.match(html, /class="card is-fav" data-key="k1"[^>]*data-favorite="1"/);
+  assert.equal(/data-key="k2"[^>]*data-favorite="1"/.test(html), false);
+  // The toggle must sit outside the card's own link, or clicking a star would open the page.
+  assert.ok(html.indexOf('data-favorite-key="k1"') < html.indexOf('<a class="card-open"'));
+});
+
+test("the session index prune skips favorited cards client-side", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  assert.match(source, /staleCards[\s\S]{0,400}getAttribute\("data-favorite"\)/);
+});
+
+test("POST /api/:key/favorite marks and unmarks a session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<html><head><title>Keeper</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const opened = await openSession(base, artifact);
+
+    const marked = await fetch(`${base}/api/${opened.key}/favorite`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ favorite: true }),
+    });
+    assert.equal(marked.status, 200);
+    assert.deepEqual(await marked.json(), { status: "ok", key: opened.key, favorite: true });
+    assert.match(await (await fetch(`${base}/session`)).text(), /data-favorite="1"/);
+
+    const cleared = await fetch(`${base}/api/${opened.key}/favorite`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ favorite: false }),
+    });
+    assert.deepEqual(await cleared.json(), { status: "ok", key: opened.key, favorite: false });
+    assert.equal(/data-favorite="1"/.test(await (await fetch(`${base}/session`)).text()), false);
+
+    const unknown = await fetch(`${base}/api/deadbeefdeadbeef/favorite`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ favorite: true }),
+    });
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(await unknown.json(), { error: "session not found" });
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/batch-delete with skipFavorites refuses to purge favorited sessions", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const pinned = path.join(dir, "pinned.html");
+  const stale = path.join(dir, "stale.html");
+  await writeFile(pinned, "<html><head><title>Pinned</title></head></html>");
+  await writeFile(stale, "<html><head><title>Stale</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const keep = await openSession(base, pinned);
+    const drop = await openSession(base, stale);
+    await fetch(`${base}/api/${keep.key}/favorite`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ favorite: true }),
+    });
+
+    const res = await fetch(`${base}/api/batch-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys: [keep.key, drop.key], skipFavorites: true }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(body.deleted, [drop.key]);
+    assert.deepEqual(body.skipped, [keep.key]);
+    assert.equal(body.count, 1);
+    assert.equal(existsSync(pinned), true);
+    assert.equal(existsSync(stale), false);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/batch-delete without skipFavorites still deletes a favorited session", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-index-"));
+  const artifact = path.join(dir, "pinned.html");
+  await writeFile(artifact, "<html><head><title>Pinned</title></head></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const opened = await openSession(base, artifact);
+    await fetch(`${base}/api/${opened.key}/favorite`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ favorite: true }),
+    });
+
+    const res = await fetch(`${base}/api/batch-delete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys: [opened.key] }),
+    });
+    const body = await res.json();
+
+    // Favorite only exempts a page from the 7-day prune; an explicit "Delete all" still applies.
+    assert.deepEqual(body.deleted, [opened.key]);
+    assert.deepEqual(body.skipped, []);
+    assert.equal(existsSync(artifact), false);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

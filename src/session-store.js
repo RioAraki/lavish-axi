@@ -44,6 +44,20 @@ export class SessionStore {
     return session;
   }
 
+  // Favorite exempts a session from the index's 7-day prune. It is stored only when true, so a
+  // record that was never marked stays byte-identical to what older releases wrote.
+  async setFavorite(key, favorite) {
+    const state = await this.readState();
+    const session = state.sessions[key];
+    if (!session) return null;
+    const updated = { ...session };
+    if (favorite) updated.favorite = true;
+    else delete updated.favorite;
+    state.sessions[key] = updated;
+    await this.writeState(state);
+    return updated;
+  }
+
   // `url` may be a builder `(slug, key) => string` for callers that need the slug the store
   // just minted; a plain string is stored verbatim. Fields written by older releases (prompts,
   // chat, status, ...) are dropped on the next upsert rather than migrated - nothing reads them.
@@ -65,6 +79,9 @@ export class SessionStore {
       opened_at: existing.opened_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
+    // The one field a human set deliberately, so unlike the dropped legacy fields it survives a
+    // re-open: displaying a page again must not quietly unprotect it from the prune.
+    if (existing.favorite === true) session.favorite = true;
     state.sessions[key] = session;
     await this.writeState(state);
     return session;

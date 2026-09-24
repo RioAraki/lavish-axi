@@ -169,6 +169,7 @@ pnpm link
 - **Allowed hosts** - To defend against DNS rebinding, the server rejects (`403`) any request whose `Host` header is missing or not one it answers to: the loopback names (`127.0.0.1`, `::1`, `localhost`) plus the configured bind and link host. If you reach the server under another name - a wildcard bind accessed by LAN IP, a reverse-proxy hostname, or an extra interface - list those names in `LAVISH_AXI_ALLOWED_HOSTS` (whitespace-separated) to allow them. Behind a reverse proxy, the forwarded `X-Forwarded-Host` is validated against the same list, so add your public hostname there and have the proxy send it. Set `LAVISH_AXI_ALLOWED_HOSTS` to `*` to disable the check entirely (only when the server sits behind your own authentication or proxy).
 - **Browser opening** - Set `LAVISH_AXI_NO_OPEN=1`, equivalent to `--no-open`, to create or resume a session without launching a browser window. This also skips the layout-audit wait, since no page is loading.
 - **Session index** - `http://127.0.0.1:4387/session` lists every artifact opened on this machine, by folder or by recency, so a closed tab is never a lost page. Deleting a card removes the session _and_ its artifact HTML file from disk.
+- **Favorites** - The star on a card marks that page as a favorite, which survives re-opening it. **Delete not opened in 7d** never counts or deletes a favorite; every other delete on the index - a card's own **Delete**, a folder's **Delete all** - still applies, because those name a specific card. Unstar the card first if you want it gone.
 
 ## CLI Reference
 

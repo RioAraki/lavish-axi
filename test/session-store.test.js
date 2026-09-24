@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -117,6 +117,36 @@ test("upsertSession stores a plain url string verbatim", async () => {
 
     assert.equal(session.url, "http://localhost:4387/session/legacy");
     assert.equal(session.slug, "artifact");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("setFavorite marks a session and re-opens keep the mark", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.equal(session.favorite, undefined);
+
+    const marked = await store.setFavorite(session.key, true);
+    assert.equal(marked.favorite, true);
+    assert.equal((await store.findByKey(session.key)).favorite, true);
+
+    // A re-open must not silently unprotect a favorited page from the prune.
+    const reopened = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    assert.equal(reopened.favorite, true);
+
+    // Unmarking drops the field entirely rather than storing `false`.
+    const cleared = await store.setFavorite(session.key, false);
+    assert.equal("favorite" in cleared, false);
+    assert.equal(JSON.parse(await readFile(stateFile, "utf8")).sessions[session.key].favorite, undefined);
+
+    assert.equal(await store.setFavorite("deadbeefdeadbeef", true), null);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

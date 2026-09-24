@@ -356,6 +356,7 @@ export async function serve({
             description: meta.description,
             opened_at: session.opened_at || "",
             updated_at: session.updated_at || "",
+            favorite: session.favorite === true,
             missing: meta.missing,
           };
         }),
@@ -400,19 +401,44 @@ export async function serve({
     }
   });
 
+  // Favorite is a local, user-set marker whose only effect is exempting a session from the
+  // index's 7-day prune. Nothing leaves the machine, so it follows /api/:key/delete rather than
+  // the same-origin-guarded share route.
+  app.post("/api/:key/favorite", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const updated = await store.setFavorite(session.key, req.body?.favorite === true);
+      res.json({ status: "ok", key: session.key, favorite: updated?.favorite === true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   // Bulk path for the index's "Delete all" and 7-day prune. Unknown keys are skipped rather than
   // failing the batch, so a stale page whose cards were already deleted elsewhere still works.
+  // The prune sends `skipFavorites` so the live record, not a long-open page's idea of it,
+  // decides whether a favorited artifact survives - deleting one also unlinks the HTML file.
   app.post("/api/batch-delete", async (req, res, next) => {
     try {
       const keys = Array.isArray(req.body?.keys) ? req.body.keys : [];
+      const skipFavorites = req.body?.skipFavorites === true;
       const deleted = [];
+      const skipped = [];
       for (const rawKey of keys) {
         const session = await store.findByKey(String(rawKey || ""));
         if (!session) continue;
+        if (skipFavorites && session.favorite === true) {
+          skipped.push(session.key);
+          continue;
+        }
         await purgeSession(session);
         deleted.push(session.key);
       }
-      res.json({ status: "deleted", deleted, count: deleted.length });
+      res.json({ status: "deleted", deleted, skipped, count: deleted.length });
       await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
@@ -974,6 +1000,9 @@ function chromeIcon(paths, size = 16, strokeWidth = 1.7) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
 }
 
+const STAR_PATH =
+  '<path d="M12 3.6l2.5 5.07 5.6.81-4.05 3.95.96 5.57L12 16.37l-5.01 2.63.96-5.57-4.05-3.95 5.6-.81z"/>';
+
 const chromeIcons = {
   more: chromeIcon(
     '<circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/>',
@@ -1003,6 +1032,10 @@ const chromeIcons = {
     '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18z"/>',
     15,
   ),
+  // Same star path twice: outlined for "not a favorite", filled for "favorite", so the two
+  // states differ by ink rather than by shape and the toggle never shifts the card's layout.
+  starOff: chromeIcon(STAR_PATH, 15),
+  starOn: chromeIcon(STAR_PATH, 15).replace('fill="none"', 'fill="currentColor"'),
   exit: chromeIcon(
     '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
     15,
@@ -1185,9 +1218,15 @@ function indexCard(entry, { home, recent }) {
   // to label the age line "updated". data-opened-at is always present because the 7-day prune
   // measures age from first open in both views.
   const updatedAttr = recent ? ` data-updated-at="${escapeHtml(String(entry?.updated_at || ""))}"` : "";
-  return `<article class="card${missing ? " is-missing" : ""}" data-key="${escapeHtml(key)}" data-opened-at="${escapeHtml(String(entry?.opened_at || ""))}"${updatedAttr}>
+  const favorite = Boolean(entry?.favorite);
+  // The star sits outside `.card-open` and is absolutely positioned over the card corner:
+  // nested inside the link, every toggle would also navigate to the artifact. It stays visible
+  // on a missing artifact so a favorited dead record can still be unmarked and pruned.
+  const favoriteButton = `<button class="card-fav${favorite ? " is-on" : ""}" type="button" data-favorite-key="${escapeHtml(key)}" data-favorite-state="${favorite ? "1" : "0"}" aria-pressed="${favorite ? "true" : "false"}" title="${favorite ? "Remove from favorites" : "Keep this page (skip the 7d prune)"}" aria-label="${favorite ? "Remove from favorites" : "Add to favorites"}">${favorite ? chromeIcons.starOn : chromeIcons.starOff}</button>`;
+  return `<article class="card${missing ? " is-missing" : ""}${favorite ? " is-fav" : ""}" data-key="${escapeHtml(key)}" data-opened-at="${escapeHtml(String(entry?.opened_at || ""))}"${updatedAttr}${favorite ? ' data-favorite="1"' : ""}>
+${favoriteButton}
 <a class="card-open" href="${escapeHtml(String(entry?.url || ""))}">
-<div class="card-top"><h3 class="card-title">${escapeHtml(title)}</h3>${missing ? '<span class="badge badge-missing">missing</span>' : ""}</div>
+<div class="card-top"><h3 class="card-title">${escapeHtml(title)}</h3>${favorite ? '<span class="badge badge-favorite">favorite</span>' : ""}${missing ? '<span class="badge badge-missing">missing</span>' : ""}</div>
 ${description ? `<p class="card-desc">${escapeHtml(description)}</p>` : ""}
 <p class="card-file">${escapeHtml(tail)}</p>
 <p class="card-age"><span class="age-label">${recent ? "updated" : "opened"}</span> <span class="age-value">recently</span></p>
@@ -1217,8 +1256,8 @@ function folderSections(entries, home) {
 }
 
 const INDEX_CSS = `
-:root { color-scheme: light dark; --bg: #f6f6f4; --panel: #ffffff; --ink: #1b1b19; --muted: #6b6b64; --line: #e2e2dc; --accent: #1f6feb; --danger: #b42318; }
-@media (prefers-color-scheme: dark) { :root { --bg: #131312; --panel: #1c1c1a; --ink: #ededea; --muted: #9a9a92; --line: #2e2e2a; --accent: #6da2ff; --danger: #ff6b5e; } }
+:root { color-scheme: light dark; --bg: #f6f6f4; --panel: #ffffff; --ink: #1b1b19; --muted: #6b6b64; --line: #e2e2dc; --accent: #1f6feb; --danger: #b42318; --star: #d99400; }
+@media (prefers-color-scheme: dark) { :root { --bg: #131312; --panel: #1c1c1a; --ink: #ededea; --muted: #9a9a92; --line: #2e2e2a; --accent: #6da2ff; --danger: #ff6b5e; --star: #f0b429; } }
 * { box-sizing: border-box; }
 body.lavish-index { margin: 0; padding: 32px clamp(16px, 5vw, 56px) 64px; background: var(--bg); color: var(--ink); font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
 .page-head { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; justify-content: space-between; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
@@ -1241,10 +1280,18 @@ body.lavish-index { margin: 0; padding: 32px clamp(16px, 5vw, 56px) 64px; backgr
 .card { position: relative; display: flex; min-width: 0; flex-direction: column; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
 .card.is-missing { opacity: 0.72; }
 .card-open { display: block; min-width: 0; padding: 16px 16px 14px; color: inherit; text-decoration: none; }
-.card-top { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.card.is-fav { border-color: color-mix(in srgb, var(--star) 55%, var(--line)); }
+/* Absolutely positioned over the card, outside .card-open, so a toggle never navigates. */
+.card-fav { position: absolute; top: 12px; right: 10px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 999px; background: none; color: var(--muted); cursor: pointer; opacity: 0.55; }
+.card-fav:hover, .card-fav:focus-visible { opacity: 1; color: var(--star); }
+.card-fav.is-on { opacity: 1; color: var(--star); }
+.card-fav[disabled] { cursor: default; opacity: 0.4; }
+/* The title row reserves the star's corner so a long title never runs under it. */
+.card-top { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding-right: 26px; }
 .card-title { margin: 0; min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; font-size: 15px; font-weight: 600; }
 .badge { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: 11px; letter-spacing: 0.02em; text-transform: lowercase; color: var(--muted); }
 .badge-missing { color: var(--danger); border-color: currentColor; }
+.badge-favorite { color: var(--star); border-color: currentColor; }
 .card-desc { margin: 8px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
 .card-file { margin: 10px 0 0; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .card-age { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
@@ -1289,9 +1336,13 @@ const INDEX_SCRIPT = `
     });
   }
 
+  // Favorited cards are invisible to the prune: they neither count toward it nor get deleted.
+  // Everything else on the page (single Delete, a folder's "Delete all") still applies to them,
+  // because those are actions a human aimed at a specific card.
   function staleCards() {
     var cutoff = Date.now() - STALE_MS;
     return cards().filter(function (card) {
+      if (card.getAttribute("data-favorite") === "1") return false;
       var openedAt = Date.parse(card.getAttribute("data-opened-at") || "");
       return isFinite(openedAt) && openedAt < cutoff;
     });
@@ -1337,9 +1388,58 @@ const INDEX_SCRIPT = `
     });
   }
 
+  // Repaints one card's favorite state in place: the star fills, the card gets its accent
+  // border and badge, and data-favorite starts (or stops) hiding it from staleCards().
+  function paintFavorite(button, on) {
+    button.classList.toggle("is-on", on);
+    button.setAttribute("data-favorite-state", on ? "1" : "0");
+    button.setAttribute("aria-pressed", on ? "true" : "false");
+    button.setAttribute("aria-label", on ? "Remove from favorites" : "Add to favorites");
+    button.setAttribute("title", on ? "Remove from favorites" : "Keep this page (skip the 7d prune)");
+    var icon = button.querySelector("svg");
+    if (icon) icon.setAttribute("fill", on ? "currentColor" : "none");
+    var card = button.closest(".card[data-key]");
+    if (!card) return;
+    card.classList.toggle("is-fav", on);
+    if (on) card.setAttribute("data-favorite", "1");
+    else card.removeAttribute("data-favorite");
+    var badge = card.querySelector(".badge-favorite");
+    var top = card.querySelector(".card-top");
+    if (on && !badge && top) {
+      badge = document.createElement("span");
+      badge.className = "badge badge-favorite";
+      badge.textContent = "favorite";
+      // Before any existing badge (such as "missing") so the order matches server rendering.
+      top.insertBefore(badge, top.querySelector(".badge"));
+    } else if (!on && badge) {
+      badge.remove();
+    }
+  }
+
   document.addEventListener("click", function (event) {
     var target = event.target && event.target.closest ? event.target : null;
     if (!target) return;
+
+    var favoriteButton = target.closest("[data-favorite-key]");
+    if (favoriteButton) {
+      // Marking a favorite destroys nothing, so it applies immediately with no confirmation.
+      var wanted = favoriteButton.getAttribute("data-favorite-state") !== "1";
+      favoriteButton.disabled = true;
+      postJson("/api/" + encodeURIComponent(favoriteButton.getAttribute("data-favorite-key")) + "/favorite", {
+        favorite: wanted,
+      })
+        .then(function (result) {
+          paintFavorite(favoriteButton, !!(result && result.favorite));
+          refresh();
+        })
+        .catch(function (error) {
+          window.alert("Could not update favorite: " + (error && error.message ? error.message : String(error)));
+        })
+        .then(function () {
+          favoriteButton.disabled = false;
+        });
+      return;
+    }
 
     var deleteButton = target.closest("[data-delete-key]");
     if (deleteButton) {
@@ -1400,9 +1500,18 @@ const INDEX_SCRIPT = `
       )
         return;
       pruneButton.disabled = true;
-      postJson("/api/batch-delete", { keys: keysOf(stale) })
-        .then(function () {
-          dropCards(stale);
+      // skipFavorites makes the server re-check the live record: this page may have been open
+      // since before a card was favorited, and a purge unlinks the artifact file for good.
+      postJson("/api/batch-delete", { keys: keysOf(stale), skipFavorites: true })
+        .then(function (result) {
+          // Only drop what the server actually purged, so a card it refused stays on the page.
+          var deleted = (result && result.deleted) || [];
+          dropCards(
+            stale.filter(function (card) {
+              return deleted.indexOf(card.getAttribute("data-key")) !== -1;
+            }),
+          );
+          refresh();
         })
         .catch(function (error) {
           failed(error);
