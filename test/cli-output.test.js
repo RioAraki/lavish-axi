@@ -212,10 +212,11 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   assert.ok(output.reference.mockup.notes.some((item) => item.includes("line numbers")));
 });
 
-test("design output recommends luxury as the default theme and warns against @apply on DaisyUI classes", () => {
+test("design output recommends corporate as the default theme and warns against @apply on DaisyUI classes", () => {
   const output = createDesignOutput();
 
-  assert.ok(output.theme_usage.some((item) => /default.*luxury|luxury.*default/i.test(item)));
+  assert.ok(output.theme_usage.some((item) => item.includes('Default to `<html data-theme="corporate">`')));
+  assert.ok(!output.theme_usage.some((item) => item.includes('data-theme="luxury"')));
   assert.ok(output.theme_usage.some((item) => item.includes("@apply") && /daisyui/i.test(item)));
   assert.ok(output.theme_usage.some((item) => /aborts the entire|no Tailwind styles/i.test(item)));
 });

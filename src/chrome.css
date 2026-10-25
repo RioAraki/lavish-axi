@@ -22,22 +22,54 @@
   --amber-900: #25230f;
   --amber-700: #5d4d1b;
   --rust-500: #f06464;
-  --bg: var(--ink-900);
-  --bg-panel: var(--ink-800);
-  --bg-bar: var(--ink-700);
-  --bg-elevated: var(--ink-600);
-  --fg: var(--cream-100);
-  --fg-muted: var(--steel-100);
-  --fg-dim: var(--steel-200);
-  --fg-faint: var(--steel-300);
-  --fg-label: var(--steel-400);
-  --border: var(--steel-600);
-  --border-subtle: var(--steel-700);
-  --border-strong: var(--steel-500);
-  --accent: var(--brass-500);
-  --accent-hover: var(--brass-400);
-  --accent-ink: var(--brass-ink);
-  --danger: var(--rust-500);
+  --paper-50: #ffffff;
+  --paper-100: #f7f6f3;
+  --paper-200: #f2f1ec;
+  --paper-300: #ece9e2;
+  --stone-700: #1a1a18;
+  --stone-600: #2f2f2b;
+  --stone-500: #4a4a44;
+  --stone-400: #6b6b63;
+  --stone-300: #8c8c83;
+  --chalk-400: #c6c3b9;
+  --chalk-300: #dcdad2;
+  --chalk-200: #e9e7e0;
+  --bronze-700: #6f4b00;
+  --bronze-600: #8a5e00;
+  --bronze-ink: #fffdf6;
+  --ember-100: #fef3c7;
+  --ember-700: #7c3a00;
+  --brick-600: #b42318;
+  /* Semantic tokens below are the light chrome, the default appearance. The dark
+     chrome is the same list re-pointed at the dark palette steps one rule down -
+     every rule in this file reads only these names, so a theme is a token swap
+     and never a second set of rules. */
+  --color-scheme: light;
+  --bg: var(--paper-100);
+  --bg-panel: var(--paper-50);
+  --bg-bar: var(--paper-50);
+  --bg-elevated: var(--paper-200);
+  --bg-hover: var(--paper-300);
+  --fg: var(--stone-700);
+  --fg-muted: var(--stone-600);
+  --fg-dim: var(--stone-500);
+  --fg-faint: var(--stone-400);
+  --fg-label: var(--stone-300);
+  --border: var(--chalk-300);
+  --border-subtle: var(--chalk-200);
+  --border-strong: var(--chalk-400);
+  --accent: var(--bronze-600);
+  --accent-hover: var(--bronze-700);
+  --accent-ink: var(--bronze-ink);
+  --danger: var(--brick-600);
+  --scrim: rgba(26, 26, 24, 0.38);
+  --scrim-veil: rgba(247, 246, 243, 0.92);
+  --scrim-solid: rgba(247, 246, 243, 0.97);
+  --banner-bg: var(--ember-100);
+  --banner-border: rgba(124, 58, 0, 0.35);
+  --banner-fg: var(--ember-700);
+  --shadow-tooltip: 0 16px 44px rgba(26, 26, 24, 0.14);
+  --shadow-floating: 0 20px 70px rgba(26, 26, 24, 0.18);
   --font-serif: "EB Garamond", "Iowan Old Style", Georgia, serif;
   --font-sans: Geist, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -93,8 +125,6 @@
   --radius-pill: 999px;
   --hairline: 1px solid var(--border);
   --hairline-subtle: 1px solid var(--border-subtle);
-  --shadow-tooltip: 0 16px 44px rgba(0, 0, 0, 0.35);
-  --shadow-floating: 0 20px 70px rgba(0, 0, 0, 0.35);
   --bar-h: 56px;
   --ease: cubic-bezier(0.2, 0.6, 0.2, 1);
   --dur-fast: 120ms;
@@ -102,6 +132,41 @@
   --dur-slow: 320ms;
   --annotate-outline: 2px solid var(--accent);
   --annotate-offset: 2px;
+  /* The backdrop behind the artifact iframe. Paper in both chrome themes: artifacts
+     own their appearance, and most are light, so a dark backdrop would flash through
+     while one loads. */
+  --artifact-backdrop: var(--paper-50);
+}
+/* The dark chrome. `data-chrome-theme-resolved` is written by the chrome before
+   first paint, so "auto" is already collapsed to light or dark here and this file
+   needs no prefers-color-scheme branch of its own. */
+:root[data-chrome-theme-resolved="dark"] {
+  --color-scheme: dark;
+  --bg: var(--ink-900);
+  --bg-panel: var(--ink-800);
+  --bg-bar: var(--ink-700);
+  --bg-elevated: var(--ink-600);
+  --bg-hover: var(--steel-700);
+  --fg: var(--cream-100);
+  --fg-muted: var(--steel-100);
+  --fg-dim: var(--steel-200);
+  --fg-faint: var(--steel-300);
+  --fg-label: var(--steel-400);
+  --border: var(--steel-600);
+  --border-subtle: var(--steel-700);
+  --border-strong: var(--steel-500);
+  --accent: var(--brass-500);
+  --accent-hover: var(--brass-400);
+  --accent-ink: var(--brass-ink);
+  --danger: var(--rust-500);
+  --scrim: rgba(15, 17, 21, 0.72);
+  --scrim-veil: rgba(15, 17, 21, 0.86);
+  --scrim-solid: rgba(15, 17, 21, 0.92);
+  --banner-bg: var(--amber-900);
+  --banner-border: rgba(244, 201, 93, 0.35);
+  --banner-fg: var(--brass-400);
+  --shadow-tooltip: 0 16px 44px rgba(0, 0, 0, 0.35);
+  --shadow-floating: 0 20px 70px rgba(0, 0, 0, 0.35);
 }
 * {
   box-sizing: border-box;
@@ -123,7 +188,7 @@ body {
   text-rendering: optimizeLegibility;
 }
 body.lavish {
-  color-scheme: dark;
+  color-scheme: var(--color-scheme);
 }
 :focus-visible {
   outline: var(--annotate-outline);
@@ -176,7 +241,7 @@ body.lavish {
 .more-button:hover:not(:disabled),
 .more-button[aria-expanded="true"] {
   border-color: var(--border-strong);
-  background: var(--steel-700);
+  background: var(--bg-hover);
   color: var(--fg);
 }
 .more-button:disabled {
@@ -228,7 +293,7 @@ body.lavish {
   color: var(--fg-muted);
 }
 .menu-file:hover {
-  background: var(--steel-700);
+  background: var(--bg-hover);
 }
 .menu-file > svg {
   opacity: 0.7;
@@ -284,6 +349,36 @@ body.lavish {
   background: var(--border);
   margin: 4px 0;
 }
+.theme-control {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+.theme-option {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  line-height: var(--lh-xs);
+  cursor: pointer;
+}
+.theme-option:hover {
+  color: var(--fg);
+}
+.theme-option[aria-pressed="true"] {
+  background: var(--bg-panel);
+  box-shadow: inset 0 0 0 1px var(--border);
+  color: var(--fg);
+  font-weight: var(--w-semi);
+}
 .menu-item {
   display: flex;
   align-items: center;
@@ -300,7 +395,7 @@ body.lavish {
   color: var(--fg);
 }
 .menu-item:hover:not(:disabled) {
-  background: var(--steel-700);
+  background: var(--bg-hover);
 }
 .menu-item:disabled {
   cursor: not-allowed;
@@ -344,7 +439,7 @@ body.lavish {
   display: grid;
   place-items: center;
   padding: var(--space-16);
-  background: rgba(15, 17, 21, 0.72);
+  background: var(--scrim);
 }
 .share-overlay[hidden] {
   display: none;
@@ -533,14 +628,14 @@ body.lavish {
 .frame {
   min-width: 0;
   min-height: 0;
-  background: #fff;
+  background: var(--artifact-backdrop);
   position: relative;
   overflow: hidden;
 }
 .curtain {
   position: fixed;
   inset: var(--bar-h) 0 0 0;
-  background: rgba(15, 17, 21, 0.86);
+  background: var(--scrim-veil);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -582,10 +677,10 @@ body.lavish {
   left: var(--space-8);
   right: var(--space-8);
   z-index: 20;
-  border: 1px solid rgba(244, 201, 93, 0.35);
+  border: 1px solid var(--banner-border);
   border-radius: var(--radius-lg);
-  background: rgba(37, 35, 15, 0.92);
-  color: var(--brass-400);
+  background: var(--banner-bg);
+  color: var(--banner-fg);
   padding: var(--space-6) var(--space-8);
   font-size: var(--text-sm);
   line-height: var(--lh-sm);
@@ -598,7 +693,7 @@ iframe {
   width: 100%;
   height: 100%;
   border: 0;
-  background: white;
+  background: var(--artifact-backdrop);
   opacity: 1;
   transition: opacity var(--dur-fast) var(--ease);
 }
@@ -622,7 +717,7 @@ body.layout-gate-active iframe#artifact {
 .whiteboard-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 17, 21, 0.92);
+  background: var(--scrim-solid);
   z-index: 80;
   display: flex;
 }

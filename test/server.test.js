@@ -219,6 +219,44 @@ test("overflow menu offers reload but no annotation, snapshot, or session contro
   assert.match(js, /event\.key === "Escape"/);
 });
 
+test("overflow menu offers a light/dark/auto appearance control that persists the choice", async () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const js = await chromeClientSource();
+
+  assert.match(html, /id="themeControl"/);
+  for (const choice of ["light", "dark", "auto"]) {
+    assert.match(html, new RegExp(`data-chrome-theme="${choice}"`));
+  }
+  assert.match(js, /const CHROME_THEME_STORAGE_KEY = "lavish:chrome-theme"/);
+  assert.match(js, /setItem\(CHROME_THEME_STORAGE_KEY, choice\)/);
+  assert.match(js, /root\.dataset\.chromeThemeResolved = resolvedChromeTheme\(choice\)/);
+  assert.match(js, /setupChromeTheme\(\);/);
+});
+
+test("chrome applies the stored appearance in the head so a dark chrome never flashes light", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const head = html.slice(0, html.indexOf("</head>"));
+
+  // Both the bootstrap and the client must agree on one storage key and one attribute.
+  assert.match(source, /localStorage\.getItem\("lavish:chrome-theme"\)/);
+  assert.match(head, /chromeThemeResolved/);
+  assert.match(head, /prefers-color-scheme: dark/);
+});
+
+test("chrome is light by default and themes every surface through tokens", async () => {
+  const css = await chromeCssSource();
+  const rules = css.slice(css.indexOf("*{box-sizing"));
+
+  // Light is the default token set; dark is the same names re-pointed one rule down.
+  assert.match(css, /:root\{[^}]*--color-scheme:light;/);
+  assert.match(css, /:root\[data-chrome-theme-resolved="dark"\]\{[^}]*--color-scheme:dark;/);
+  // No rule may hardcode a color or reach for a raw palette step - that is what would
+  // force a second set of rules per theme.
+  assert.doesNotMatch(rules, /rgba\(|#[0-9a-f]{3,8}/i);
+  assert.doesNotMatch(rules, /var\(--(ink|cream|steel|brass|paper|stone|chalk|bronze|ember|brick)-/);
+});
+
 test("overflow menu offers a standalone HTML export that downloads a portable file", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const js = await chromeClientSource();

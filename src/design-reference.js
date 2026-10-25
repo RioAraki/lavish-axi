@@ -219,7 +219,7 @@ export function createDesignOutput() {
       versions: { mermaid: MERMAID_VERSION },
     },
     theme_usage: [
-      'Default to `<html data-theme="luxury">` - it matches the Lavish look. Pick a different theme from the list below only when the user asked for one or the content clearly calls for it.',
+      'Default to `<html data-theme="corporate">` - a light, high-contrast theme that stays readable for long technical reading, which is what most artifacts are for. Pick a different theme from the list below only when the user asked for one or the content clearly calls for it; `luxury` or `night` suit a deliberately dark surface such as a dashboard or a dark-mode mockup.',
       'Set a nested section theme with `<section data-theme="night">`.',
       "Prefer semantic colors such as `bg-base-100`, `bg-base-200`, `text-base-content`, `bg-primary`, `text-primary-content`, `alert-warning`, and `btn-primary` so themes remain readable.",
       "Avoid hardcoded Tailwind color names for text and surfaces unless the user asked for exact colors.",

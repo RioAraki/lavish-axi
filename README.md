@@ -152,9 +152,11 @@ pnpm link
   Unresolved local assets or export notices such as author-set CSP meta tags and redacted file URLs are surfaced in command or browser output.
   Use `--token` or `LAVISH_AXI_HTML_APP_TOKEN` for an optional bearer token; set `LAVISH_AXI_HTML_APP_API_URL` only when overriding the ht-ml.app API base.
 - **Live reload** - Lavish watches the HTML artifact file by default and preserves the artifact iframe scroll position across reloads. To also reload on sibling asset changes, add `data-lavish-live-reload-root` to the root element or `<meta name="lavish-live-reload" content="root">`.
-- **Browser chrome** - The chrome is a thin top bar over a full-width artifact iframe: a wordmark and one overflow menu (copy path, reload artifact, export standalone HTML, publish link).
+- **Browser chrome** - The chrome is a thin top bar over a full-width artifact iframe: a wordmark and one overflow menu (copy path, reload artifact, export standalone HTML, publish link, appearance).
   There is no annotation mode, conversation panel, composer, or session-end control - Lavish collects nothing from the browser, so feedback happens in the agent conversation instead.
   Escape closes the publish dialog, the fullscreen diagram, or the open menu.
+- **Appearance** - The overflow menu's **Appearance** control themes the chrome itself: **Light** (the default), **Dark**, or **Auto** to follow the operating system. The choice is remembered per browser and applies to every session you open in it.
+  It does not reach into the artifact - that is sandboxed, portable HTML whose own `data-theme` or CSS decides how it looks, so it renders the same when opened directly without Lavish. Ask your agent for a light or dark page instead; `lavish-axi design` tells agents to default to a light, high-contrast theme.
 - **Mermaid diagrams** - In the Lavish browser, every rendered Mermaid diagram in a `.mermaid` container is displayed as a formally styled Excalidraw drawing - flat strokes, solid fills, and a diagram typeface instead of Excalidraw's hand-drawn defaults.
   Use a diagram's Fullscreen action to view it over the whole viewport; the canvas pans and zooms but is view-only, and nothing is persisted.
   A live reload re-converts an open diagram from the artifact's current Mermaid source, which stays the single representation of the diagram.

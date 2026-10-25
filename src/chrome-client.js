@@ -41,6 +41,7 @@ const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
 const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardError"));
+const themeControl = /** @type {HTMLDivElement} */ (document.getElementById("themeControl"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
@@ -58,6 +59,60 @@ let layoutGateTimer;
 let lastScroll = { x: 0, y: 0 };
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let copyHintTimer;
+
+// Appearance of the chrome itself - the bar, menus and overlays. The artifact keeps its
+// own look: it is sandboxed, portable HTML that must render the same when opened without
+// Lavish, so nothing here reaches inside the iframe.
+// The head bootstrap in createChromeHtml already applied the stored choice before paint;
+// this only owns the control, persistence, and keeping "auto" current.
+const CHROME_THEME_STORAGE_KEY = "lavish:chrome-theme";
+const CHROME_THEMES = ["light", "dark", "auto"];
+const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)");
+
+function storedChromeTheme() {
+  let stored;
+  try {
+    stored = window.localStorage?.getItem(CHROME_THEME_STORAGE_KEY);
+  } catch {
+    stored = null;
+  }
+  return CHROME_THEMES.includes(String(stored)) ? String(stored) : "light";
+}
+
+function resolvedChromeTheme(choice) {
+  if (choice !== "auto") return choice;
+  return prefersDark?.matches ? "dark" : "light";
+}
+
+function applyChromeTheme(choice, { persist = false } = {}) {
+  const root = document.documentElement;
+  root.dataset.chromeTheme = choice;
+  root.dataset.chromeThemeResolved = resolvedChromeTheme(choice);
+  for (const option of themeControl?.querySelectorAll("[data-chrome-theme]") || []) {
+    option.setAttribute("aria-pressed", String(option.getAttribute("data-chrome-theme") === choice));
+  }
+  if (persist) {
+    try {
+      window.localStorage?.setItem(CHROME_THEME_STORAGE_KEY, choice);
+    } catch {
+      // A chrome with no writable storage still themes this page; it just forgets the choice.
+    }
+  }
+}
+
+function setupChromeTheme() {
+  applyChromeTheme(storedChromeTheme());
+  themeControl?.addEventListener("click", (event) => {
+    const option = /** @type {HTMLElement | null} */ (event.target)?.closest?.("[data-chrome-theme]");
+    const choice = option?.getAttribute("data-chrome-theme");
+    if (!choice || !CHROME_THEMES.includes(choice)) return;
+    applyChromeTheme(choice, { persist: true });
+  });
+  // Only "auto" tracks the OS; an explicit Light or Dark choice stays put.
+  prefersDark?.addEventListener?.("change", () => {
+    if (document.documentElement.dataset.chromeTheme === "auto") applyChromeTheme("auto");
+  });
+}
 
 function setMenuOpen(button, menu, open) {
   menu.hidden = !open;
@@ -390,7 +445,10 @@ let chromeRestartReloadPromise = null;
 const inlineWhiteboardChannels = new Map();
 
 function whiteboardTheme() {
-  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  // Follow the chrome's own appearance rather than the OS, so a whiteboard opened from a
+  // light chrome is light even on a dark desktop. The frame takes its theme once at init,
+  // so this is read when a whiteboard opens, not when the chrome theme changes.
+  return document.documentElement.dataset.chromeThemeResolved === "dark" ? "dark" : "light";
 }
 
 function postToWhiteboardOverlay(message) {
@@ -680,6 +738,7 @@ frame.addEventListener("load", () => {
   }
 });
 
+setupChromeTheme();
 initializeLayoutGate();
 
 const events = new EventSource("/events/" + key);
